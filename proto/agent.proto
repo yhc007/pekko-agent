@@ -1,0 +1,59 @@
+syntax = "proto3";
+package pekko.agent.v1;
+
+service AgentService {
+  rpc Query(QueryRequest) returns (QueryResponse);
+  rpc StreamQuery(QueryRequest) returns (stream QueryChunk);
+  rpc AssignTask(TaskRequest) returns (TaskResponse);
+  rpc GetStatus(StatusRequest) returns (StatusResponse);
+}
+
+message QueryRequest {
+  string session_id = 1;
+  string content = 2;
+  string tenant_id = 3;
+  string user_id = 4;
+}
+
+message QueryResponse {
+  string content = 1;
+  repeated Citation citations = 2;
+  TokenUsage usage = 3;
+}
+
+message QueryChunk {
+  string delta = 1;
+  bool done = 2;
+}
+
+message TaskRequest {
+  string task_id = 1;
+  string agent_type = 2;
+  string description = 3;
+  string input_json = 4;
+}
+
+message TaskResponse {
+  string task_id = 1;
+  string status = 2;
+}
+
+message StatusRequest {
+  string agent_id = 1;
+}
+
+message StatusResponse {
+  string agent_id = 1;
+  string state = 2;
+  uint64 total_requests = 3;
+}
+
+message Citation {
+  string source = 1;
+  string text = 2;
+}
+
+message TokenUsage {
+  uint32 input_tokens = 1;
+  uint32 output_tokens = 2;
+}
