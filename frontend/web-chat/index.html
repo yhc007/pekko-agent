@@ -365,17 +365,28 @@
     <script>
         // 테이블 데이터를 Excel(.xlsx)로 다운로드
         function downloadTableAsCSV(messageId) {
+            console.log('downloadTableAsCSV called with:', messageId);
             const msgEl = document.getElementById('msg-' + messageId);
-            if (!msgEl) return;
+            console.log('Found element:', msgEl);
+            if (!msgEl) {
+                console.error('Element not found: msg-' + messageId);
+                // DOM에서 모든 msg- ID 출력
+                document.querySelectorAll('[id^="msg-"]').forEach(el => console.log('Available:', el.id));
+                return;
+            }
             
             const table = msgEl.querySelector('table');
+            console.log('Found table:', table);
             if (!table) {
                 alert('테이블을 찾을 수 없습니다.');
                 return;
             }
             
             // SheetJS로 테이블을 워크북으로 변환
-            const wb = XLSX.utils.book_new();
+            console.log('XLSX available:', typeof XLSX);
+            try {
+                const wb = XLSX.utils.book_new();
+                console.log('Workbook created');
             const ws = XLSX.utils.table_to_sheet(table);
             
             // 컬럼 너비 자동 조정
@@ -396,9 +407,27 @@
             
             XLSX.utils.book_append_sheet(wb, ws, 'Data');
             
-            // 파일 다운로드
+            // 파일 다운로드 (명시적 Blob 방식)
             const filename = 'data_' + new Date().toISOString().slice(0,10) + '.xlsx';
-            XLSX.writeFile(wb, filename);
+            console.log('Downloading:', filename);
+            
+            // Blob으로 변환 후 다운로드
+            const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+            const blob = new Blob([wbout], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+            const url = URL.createObjectURL(blob);
+            
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            
+            console.log('Download triggered!');
+            } catch (e) {
+                console.error('XLSX error:', e);
+            }
         }
     </script>
 </head>
