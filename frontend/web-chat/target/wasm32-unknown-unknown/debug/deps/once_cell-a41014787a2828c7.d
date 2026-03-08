@@ -1,9 +1,0 @@
-/Users/paulyu/workRust/pekko-agent/frontend/web-chat/target/wasm32-unknown-unknown/debug/deps/once_cell-a41014787a2828c7.d: /Users/paulyu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/once_cell-1.21.3/src/lib.rs /Users/paulyu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/once_cell-1.21.3/src/imp_std.rs /Users/paulyu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/once_cell-1.21.3/src/race.rs
-
-/Users/paulyu/workRust/pekko-agent/frontend/web-chat/target/wasm32-unknown-unknown/debug/deps/libonce_cell-a41014787a2828c7.rlib: /Users/paulyu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/once_cell-1.21.3/src/lib.rs /Users/paulyu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/once_cell-1.21.3/src/imp_std.rs /Users/paulyu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/once_cell-1.21.3/src/race.rs
-
-/Users/paulyu/workRust/pekko-agent/frontend/web-chat/target/wasm32-unknown-unknown/debug/deps/libonce_cell-a41014787a2828c7.rmeta: /Users/paulyu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/once_cell-1.21.3/src/lib.rs /Users/paulyu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/once_cell-1.21.3/src/imp_std.rs /Users/paulyu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/once_cell-1.21.3/src/race.rs
-
-/Users/paulyu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/once_cell-1.21.3/src/lib.rs:
-/Users/paulyu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/once_cell-1.21.3/src/imp_std.rs:
-/Users/paulyu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/once_cell-1.21.3/src/race.rs:

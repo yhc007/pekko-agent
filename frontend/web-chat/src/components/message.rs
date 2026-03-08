@@ -1,7 +1,14 @@
 use yew::prelude::*;
+use wasm_bindgen::prelude::*;
 
 use crate::markdown;
 use crate::types::{ChatMessage, MessageRole};
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = window)]
+    fn downloadTableAsCSV(message_id: &str);
+}
 
 #[derive(Properties, PartialEq)]
 pub struct MessageProps {
@@ -19,8 +26,8 @@ pub fn message_bubble(props: &MessageProps) -> Html {
 
     let avatar = match msg.role {
         MessageRole::User => "👤",
-        MessageRole::Assistant => "🤖",
-        MessageRole::System => "ℹ️",
+        MessageRole::Assistant => "AI",
+        MessageRole::System => "AI",
     };
 
     let tools_html = if !msg.tools_used.is_empty() {
@@ -45,17 +52,35 @@ pub fn message_bubble(props: &MessageProps) -> Html {
         html! {}
     };
 
+    // 테이블이 있는지 확인 (마크다운 테이블 형식: |로 시작하는 줄)
+    let has_table = msg.content.lines().any(|line| line.trim().starts_with('|'));
+    let msg_id = msg.id.clone();
+    
     // 어시스턴트/시스템 메시지는 마크다운 렌더링, 사용자 메시지는 일반 텍스트
     let content_html = match msg.role {
         MessageRole::Assistant | MessageRole::System => {
             let rendered = markdown::markdown_to_html(&msg.content);
             Html::from_html_unchecked(AttrValue::from(
-                format!("<div class=\"message-bubble md-content\">{rendered}</div>")
+                format!("<div class=\"message-bubble md-content\" id=\"msg-{}\">{}</div>", msg.id, rendered)
             ))
         }
         MessageRole::User => {
             html! { <div class="message-bubble">{ &msg.content }</div> }
         }
+    };
+    
+    // 테이블이 있으면 다운로드 버튼 표시
+    let download_btn = if has_table && matches!(msg.role, MessageRole::Assistant | MessageRole::System) {
+        let id = msg_id.clone();
+        html! {
+            <button class="download-csv-btn" onclick={Callback::from(move |_| {
+                downloadTableAsCSV(&id);
+            })}>
+                { "📥 엑셀 다운로드" }
+            </button>
+        }
+    } else {
+        html! {}
     };
 
     html! {
@@ -63,6 +88,7 @@ pub fn message_bubble(props: &MessageProps) -> Html {
             <div class="message-avatar">{ avatar }</div>
             <div>
                 { content_html }
+                { download_btn }
                 { tools_html }
                 { token_html }
             </div>
@@ -74,7 +100,7 @@ pub fn message_bubble(props: &MessageProps) -> Html {
 pub fn typing_indicator() -> Html {
     html! {
         <div class="message-row assistant">
-            <div class="message-avatar">{ "🤖" }</div>
+            <div class="message-avatar">{ "AI" }</div>
             <div class="typing-indicator">
                 <div class="typing-dot"></div>
                 <div class="typing-dot"></div>

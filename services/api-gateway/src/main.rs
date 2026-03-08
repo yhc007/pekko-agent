@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use tracing::{info, error, warn};
 
-use pekko_agent_core::{Message, TokenUsage, ShortTermMemory, ToolContext};
-use pekko_agent_llm::{LlmConfig, ClaudeClient, LlmRequest, ClaudeMessage, ContentBlock, ClaudeTool};
+use pekko_agent_core::{Message, TokenUsage, ShortTermMemory, ToolContext, AgentInfo, AgentStatus};
+use pekko_agent_llm::{LlmConfig, ClaudeClient, GeminiClient, OpenAIClient, LlmRequest, ClaudeMessage, ContentBlock, ClaudeTool};
 use pekko_agent_tools::{ToolRegistry, builtin::{PermitSearchTool, ComplianceCheckTool, EhsQueryTool}};
 use pekko_agent_memory::{InMemoryConversationStore, InMemoryVectorStore, InMemoryEpisodicStore};
 use pekko_agent_orchestrator::OrchestratorActor;
@@ -38,6 +38,9 @@ struct AppState {
     audit_logger: Arc<AuditLogger>,
     llm_config: LlmConfig,
     claude_client: Arc<ClaudeClient>,
+    gemini_client: Option<Arc<GeminiClient>>,
+    openai_client: Option<Arc<OpenAIClient>>,
+    llm_provider: String,
 }
 
 /// Request payload for agent queries
@@ -317,12 +320,45 @@ async fn query_agent(
             cacheable: false,
         };
 
-        let resp = match state.claude_client.send_message(&llm_request).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                error!(error = %e, round = round, "LLM call failed");
-                final_text = format!("죄송합니다. AI 응답 생성 중 오류가 발생했습니다: {}", e);
+        // Call LLM based on provider
+        let resp = if state.llm_provider == "openai" {
+            if let Some(ref openai) = state.openai_client {
+                match openai.send_message(&llm_request).await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        error!(error = %e, round = round, "OpenAI call failed");
+                        final_text = format!("죄송합니다. AI 응답 생성 중 오류가 발생했습니다: {}", e);
+                        break;
+                    }
+                }
+            } else {
+                error!("OpenAI client not configured");
+                final_text = "OpenAI API 키가 설정되지 않았습니다.".to_string();
                 break;
+            }
+        } else if state.llm_provider == "gemini" {
+            if let Some(ref gemini) = state.gemini_client {
+                match gemini.send_message(&llm_request).await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        error!(error = %e, round = round, "Gemini call failed");
+                        final_text = format!("죄송합니다. AI 응답 생성 중 오류가 발생했습니다: {}", e);
+                        break;
+                    }
+                }
+            } else {
+                error!("Gemini client not configured");
+                final_text = "Gemini API 키가 설정되지 않았습니다.".to_string();
+                break;
+            }
+        } else {
+            match state.claude_client.send_message(&llm_request).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    error!(error = %e, round = round, "Claude call failed");
+                    final_text = format!("죄송합니다. AI 응답 생성 중 오류가 발생했습니다: {}", e);
+                    break;
+                }
             }
         };
 
@@ -517,19 +553,69 @@ async fn main() -> anyhow::Result<()> {
 
     info!(tools = tool_registry.list_tools().len(), "Tool registry initialized");
 
+    // Create orchestrator and register agents
+    let orchestrator = OrchestratorActor::new();
+    let orchestrator = Arc::new(RwLock::new(orchestrator));
+
+    // Register EHS agents
+    {
+        let mut orch = orchestrator.write().await;
+        orch.register_agent(AgentInfo {
+            agent_id: "ehs-permit-agent".to_string(),
+            agent_type: "ehs".to_string(),
+            description: "위험작업 허가(PTW) 관리 에이전트".to_string(),
+            capabilities: vec!["permit_search".to_string(), "ehs_query".to_string()],
+            status: AgentStatus::Available,
+        });
+        orch.register_agent(AgentInfo {
+            agent_id: "ehs-inspection-agent".to_string(),
+            agent_type: "ehs".to_string(),
+            description: "안전점검 및 위험성 평가 에이전트".to_string(),
+            capabilities: vec!["ehs_query".to_string()],
+            status: AgentStatus::Available,
+        });
+        orch.register_agent(AgentInfo {
+            agent_id: "ehs-compliance-agent".to_string(),
+            agent_type: "ehs".to_string(),
+            description: "법규/규정 준수 확인 에이전트".to_string(),
+            capabilities: vec!["compliance_check".to_string(), "ehs_query".to_string()],
+            status: AgentStatus::Available,
+        });
+        info!("Registered {} EHS agents", orch.list_agents().len());
+    }
+
+    // Determine LLM provider
+    let llm_provider = std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "claude".to_string());
+    info!(provider = %llm_provider, "LLM provider selected");
+
+    // Create Gemini client if API key available
+    let gemini_client = std::env::var("GOOGLE_API_KEY").ok().map(|key| {
+        let model = std::env::var("GEMINI_MODEL").ok();
+        Arc::new(GeminiClient::new(key, model))
+    });
+
+    // Create OpenAI client if API key available
+    let openai_client = std::env::var("OPENAI_API_KEY").ok().map(|key| {
+        let model = std::env::var("OPENAI_MODEL").ok();
+        Arc::new(OpenAIClient::new(key, model))
+    });
+
     // Create application state
     let state = AppState {
         tool_registry: Arc::new(RwLock::new(tool_registry)),
         conversation_store: Arc::new(InMemoryConversationStore::new(100)),
         vector_store: Arc::new(InMemoryVectorStore::new()),
         episodic_store: Arc::new(InMemoryEpisodicStore::new()),
-        orchestrator: Arc::new(RwLock::new(OrchestratorActor::new())),
+        orchestrator,
         event_publisher: Arc::new(EventPublisher::new("pekko-agent", 1024)),
         rbac: Arc::new(RwLock::new(RbacManager::new())),
         tenant_manager: Arc::new(RwLock::new(TenantManager::new())),
         audit_logger: Arc::new(AuditLogger::new(10000)),
         llm_config,
         claude_client,
+        gemini_client,
+        openai_client,
+        llm_provider,
     };
 
     // Build the router

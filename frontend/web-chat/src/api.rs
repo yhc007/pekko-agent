@@ -6,7 +6,16 @@ use crate::types::*;
 const DEFAULT_BASE_URL: &str = "http://localhost:8080";
 
 fn base_url() -> String {
-    // In production, could read from window.location or a config
+    // Dynamically determine API URL based on current location
+    if let Some(window) = web_sys::window() {
+        if let Ok(href) = window.location().href() {
+            // If accessing via agenticai.coreon.build, use api subdomain
+            if href.contains("agenticai.coreon.build") {
+                return "https://agenticai-api.coreon.build".to_string();
+            }
+        }
+    }
+    // Fallback to localhost for development
     DEFAULT_BASE_URL.to_string()
 }
 

@@ -45,7 +45,7 @@ pub fn chat_area(props: &ChatProps) -> Html {
 
         html! {
             <div class="welcome">
-                <div class="welcome-icon">{ "🏭" }</div>
+                <div class="welcome-icon"></div>
                 <h2>{ "EHS AI Agent에 오신 것을 환영합니다" }</h2>
                 <p>
                     if props.has_agent {
