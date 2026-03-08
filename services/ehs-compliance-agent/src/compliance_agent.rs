@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 use pekko_agent_core::*;
+use pekko_actor::{Actor, ActorContext};
+use pekko_persistence::{PersistentActor, PersistentContext};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -12,8 +14,9 @@ pub struct ComplianceAgentActor {
     execution_context: ExecutionContext,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub enum ComplianceAgentState {
+    #[default]
     Idle,
     IdentifyingRequirements {
         facility_id: String,
@@ -584,5 +587,222 @@ impl AgentActor for ComplianceAgentActor {
 
     fn transition(&mut self, new_state: AgentState) {
         self.state = new_state;
+    }
+}
+
+// ─── pekko_actor::Actor implementation ──────────────────────────────────────
+
+impl Actor for ComplianceAgentActor {
+    type Message = AgentMessage;
+
+    async fn receive(&mut self, msg: AgentMessage, _ctx: &mut ActorContext<Self>) {
+        match msg {
+            AgentMessage::Query(query) => {
+                match self.reason(&query).await {
+                    Ok(action) => {
+                        tracing::debug!(
+                            agent_id = %self.agent_id,
+                            "ComplianceAgent: reason produced action"
+                        );
+                        if let Ok(observations) = self.act(&action).await {
+                            if !observations.is_empty() {
+                                let _ = self.respond(&observations).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(agent_id = %self.agent_id, error = ?e, "ComplianceAgent: reason failed");
+                    }
+                }
+            }
+            AgentMessage::Execute(action) => {
+                if let Err(e) = self.act(&action).await {
+                    tracing::error!(agent_id = %self.agent_id, error = ?e, "ComplianceAgent: act failed");
+                }
+            }
+            AgentMessage::Respond(observations) => {
+                if let Err(e) = self.respond(&observations).await {
+                    tracing::error!(agent_id = %self.agent_id, error = ?e, "ComplianceAgent: respond failed");
+                }
+            }
+        }
+    }
+
+}
+
+// ─── pekko_persistence::PersistentActor implementation ──────────────────────
+
+/// Domain events written to the persistence journal for compliance lifecycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ComplianceJournalEvent {
+    AuditStarted {
+        audit_id: String,
+        facility_id: String,
+        regulations: Vec<String>,
+    },
+    ComplianceChecked {
+        facility_id: String,
+        conformance_percentage: u32,
+        checks_passed: u32,
+        checks_failed: u32,
+    },
+    GapAnalysisCompleted {
+        facility_id: String,
+        total_gaps: u32,
+        critical_gaps: u32,
+        major_gaps: u32,
+        minor_gaps: u32,
+    },
+    RemediationPlanCreated {
+        plan_id: String,
+        facility_id: String,
+        action_items: u32,
+    },
+    ComplianceReportGenerated {
+        report_id: String,
+        facility_id: String,
+        overall_score: u32,
+    },
+}
+
+/// Full snapshot for fast compliance agent recovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComplianceAgentSnapshot {
+    pub agent_id: String,
+    pub compliance_state: ComplianceAgentState,
+    pub facility_id: Option<String>,
+    pub applicable_regulations: Vec<String>,
+    pub identified_gaps: Vec<ComplianceGap>,
+    pub remediation_actions: Vec<RemediationAction>,
+}
+
+impl PersistentActor for ComplianceAgentActor {
+    type Event    = ComplianceJournalEvent;
+    type State    = ComplianceAgentState;
+    type Snapshot = ComplianceAgentSnapshot;
+
+    fn persistence_id(&self) -> String {
+        format!("compliance-agent-{}", self.agent_id)
+    }
+
+    async fn receive_recover(
+        &mut self,
+        event: Self::Event,
+        _ctx: &mut PersistentContext<Self>,
+    ) {
+        match event {
+            ComplianceJournalEvent::AuditStarted { audit_id, facility_id, regulations } => {
+                self.execution_context.facility_id = Some(facility_id.clone());
+                self.execution_context.applicable_regulations = regulations.clone();
+                self.compliance_state = ComplianceAgentState::CheckingCompliance {
+                    audit_id,
+                    check_count: regulations.len(),
+                };
+            }
+            ComplianceJournalEvent::ComplianceChecked { facility_id, conformance_percentage, .. } => {
+                self.execution_context.facility_id = Some(facility_id.clone());
+                self.compliance_state = ComplianceAgentState::MonitoringComplianceStatus {
+                    facility_id,
+                    conformance_percentage: conformance_percentage as f64,
+                };
+            }
+            ComplianceJournalEvent::GapAnalysisCompleted { total_gaps, critical_gaps, major_gaps, minor_gaps, .. } => {
+                let mut severity_breakdown = HashMap::new();
+                severity_breakdown.insert("Critical".to_string(), critical_gaps as usize);
+                severity_breakdown.insert("Major".to_string(), major_gaps as usize);
+                severity_breakdown.insert("Minor".to_string(), minor_gaps as usize);
+
+                self.compliance_state = ComplianceAgentState::AnalyzingGaps {
+                    gap_count: total_gaps as usize,
+                    severity_breakdown,
+                };
+            }
+            ComplianceJournalEvent::RemediationPlanCreated { plan_id, action_items, .. } => {
+                self.compliance_state = ComplianceAgentState::DevelopingRemediationPlan {
+                    plan_id,
+                    action_items: action_items as usize,
+                };
+            }
+            ComplianceJournalEvent::ComplianceReportGenerated { report_id, .. } => {
+                self.compliance_state = ComplianceAgentState::GeneratingComplianceReport { report_id };
+            }
+        }
+    }
+
+    async fn receive_command(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut PersistentContext<Self>,
+    ) {
+        match msg {
+            AgentMessage::Query(query) => {
+                if let Ok(action) = self.reason(&query).await {
+                    if let Ok(obs) = self.act(&action).await {
+                        if !obs.is_empty() {
+                            let _ = self.respond(&obs).await;
+                        }
+                    }
+                }
+            }
+            AgentMessage::Execute(action) => { let _ = self.act(&action).await; }
+            AgentMessage::Respond(obs)    => { let _ = self.respond(&obs).await; }
+        }
+    }
+
+    fn apply_event(&mut self, event: &Self::Event) -> Self::State {
+        match event {
+            ComplianceJournalEvent::AuditStarted { audit_id, regulations, .. } => {
+                ComplianceAgentState::CheckingCompliance {
+                    audit_id:    audit_id.clone(),
+                    check_count: regulations.len(),
+                }
+            }
+            ComplianceJournalEvent::ComplianceChecked { facility_id, conformance_percentage, .. } => {
+                ComplianceAgentState::MonitoringComplianceStatus {
+                    facility_id:             facility_id.clone(),
+                    conformance_percentage:  *conformance_percentage as f64,
+                }
+            }
+            ComplianceJournalEvent::GapAnalysisCompleted { total_gaps, critical_gaps, major_gaps, minor_gaps, .. } => {
+                let mut severity_breakdown = HashMap::new();
+                severity_breakdown.insert("Critical".to_string(), *critical_gaps as usize);
+                severity_breakdown.insert("Major".to_string(),    *major_gaps as usize);
+                severity_breakdown.insert("Minor".to_string(),    *minor_gaps as usize);
+                ComplianceAgentState::AnalyzingGaps {
+                    gap_count: *total_gaps as usize,
+                    severity_breakdown,
+                }
+            }
+            ComplianceJournalEvent::RemediationPlanCreated { plan_id, action_items, .. } => {
+                ComplianceAgentState::DevelopingRemediationPlan {
+                    plan_id:      plan_id.clone(),
+                    action_items: *action_items as usize,
+                }
+            }
+            ComplianceJournalEvent::ComplianceReportGenerated { report_id, .. } => {
+                ComplianceAgentState::GeneratingComplianceReport {
+                    report_id: report_id.clone(),
+                }
+            }
+        }
+    }
+
+    fn create_snapshot(&self) -> Self::Snapshot {
+        ComplianceAgentSnapshot {
+            agent_id:                self.agent_id.clone(),
+            compliance_state:        self.compliance_state.clone(),
+            facility_id:             self.execution_context.facility_id.clone(),
+            applicable_regulations:  self.execution_context.applicable_regulations.clone(),
+            identified_gaps:         self.execution_context.identified_gaps.clone(),
+            remediation_actions:     self.execution_context.remediation_actions.clone(),
+        }
+    }
+
+    fn apply_snapshot(&mut self, snapshot: Self::Snapshot) {
+        self.compliance_state = snapshot.compliance_state;
+        self.execution_context.facility_id             = snapshot.facility_id;
+        self.execution_context.applicable_regulations  = snapshot.applicable_regulations;
+        self.execution_context.identified_gaps         = snapshot.identified_gaps;
+        self.execution_context.remediation_actions     = snapshot.remediation_actions;
     }
 }

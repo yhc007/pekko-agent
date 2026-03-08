@@ -16,3 +16,4 @@ chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+sqlx.workspace = true

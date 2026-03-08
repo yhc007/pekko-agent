@@ -25,7 +25,7 @@ pub struct WorkflowStep {
     pub timeout_ms: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum WorkflowStatus {
     Created,
     Running { current_step: usize },
@@ -82,4 +82,98 @@ impl Workflow {
             _ => false,
         }
     }
+}
+
+// ─── pekko_actor FSM-backed executor ─────────────────────────────────────────
+//
+// Wraps a Workflow in a `pekko_actor::FsmStateMachine` so that each lifecycle
+// transition is governed by the FSM engine (entry/exit actions, history,
+// timeout support) rather than ad-hoc `match` arms.
+
+use pekko_actor::{FsmStateMachine, StateMachineBuilder, TransitionResult};
+
+/// Events that drive the FSM (mirrors WorkflowStatus transitions).
+#[derive(Debug, Clone)]
+pub enum WorkflowEvent {
+    Start,
+    Advance,
+    Pause,
+    Resume,
+    Complete,
+    Cancel,
+    Fail { at_step: usize, error: String },
+}
+
+/// Build a fresh FSM for the given workflow.
+/// The FSM data is the step index (`usize`).
+pub fn build_workflow_fsm(
+    workflow: &Workflow,
+) -> FsmStateMachine<WorkflowStatus, usize, WorkflowEvent> {
+    use WorkflowStatus::*;
+    let total = workflow.steps.len();
+
+    StateMachineBuilder::new(WorkflowStatus::Created, 0usize)
+        // Created → Running on Start
+        .state(WorkflowStatus::Created)
+            .on_event(
+                |e| matches!(e, WorkflowEvent::Start),
+                |_s, _d, _e| TransitionResult::GoTo(WorkflowStatus::Running { current_step: 0 }, Some(0)),
+            )
+            .on_event(
+                |e| matches!(e, WorkflowEvent::Cancel),
+                |_s, _d, _e| TransitionResult::GoTo(WorkflowStatus::Cancelled, None),
+            )
+            .end_state()
+        // Running → next step / Completed / Paused / Failed
+        .state(WorkflowStatus::Running { current_step: 0 })
+            .on_event(
+                |e| matches!(e, WorkflowEvent::Advance),
+                move |s, d, _e| {
+                    let next = d + 1;
+                    if next < total {
+                        TransitionResult::GoTo(
+                            Running { current_step: next },
+                            Some(next),
+                        )
+                    } else {
+                        TransitionResult::GoTo(Completed, Some(next))
+                    }
+                },
+            )
+            .on_event(
+                |e| matches!(e, WorkflowEvent::Pause),
+                |_s, d, _e| TransitionResult::GoTo(Paused { at_step: *d }, Some(*d)),
+            )
+            .on_event(
+                |e| matches!(e, WorkflowEvent::Cancel),
+                |_s, _d, _e| TransitionResult::GoTo(Cancelled, None),
+            )
+            .on_event(
+                |e| matches!(e, WorkflowEvent::Fail { .. }),
+                |_s, d, e| {
+                    if let WorkflowEvent::Fail { at_step, error } = e.clone() {
+                        TransitionResult::GoTo(
+                            Failed { at_step, error },
+                            Some(*d),
+                        )
+                    } else {
+                        TransitionResult::Stay(None)
+                    }
+                },
+            )
+            .end_state()
+        // Paused → Running on Resume
+        .state(WorkflowStatus::Paused { at_step: 0 })
+            .on_event(
+                |e| matches!(e, WorkflowEvent::Resume),
+                |_s, d, _e| TransitionResult::GoTo(Running { current_step: *d }, Some(*d)),
+            )
+            .end_state()
+        .state(WorkflowStatus::Completed)
+            .end_state()
+        .state(WorkflowStatus::Cancelled)
+            .end_state()
+        .state(WorkflowStatus::Failed { at_step: 0, error: String::new() })
+            .end_state()
+        .build()
 }

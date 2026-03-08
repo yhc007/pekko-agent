@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+pekko-actor.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 serde.workspace = true

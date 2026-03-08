@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 use pekko_agent_core::*;
+use pekko_actor::{Actor, ActorContext};
+use pekko_persistence::{PersistentActor, PersistentContext};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -11,8 +13,9 @@ pub struct PermitAgentActor {
     execution_context: ExecutionContext,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub enum PermitAgentState {
+    #[default]
     Idle,
     AnalyzingRequest {
         request_id: String,
@@ -460,5 +463,220 @@ impl AgentActor for PermitAgentActor {
 
     fn transition(&mut self, new_state: AgentState) {
         self.state = new_state;
+    }
+}
+
+// ─── pekko_actor::Actor implementation ──────────────────────────────────────
+//
+// Routes AgentMessage variants to the ReAct-loop methods defined above.
+// This satisfies the Actor<Message = AgentMessage> super-trait bound on
+// AgentActor, allowing PermitAgentActor to be spawned inside an ActorSystem.
+
+impl Actor for PermitAgentActor {
+    type Message = AgentMessage;
+
+    async fn receive(&mut self, msg: AgentMessage, _ctx: &mut ActorContext<Self>) {
+        match msg {
+            AgentMessage::Query(query) => {
+                match self.reason(&query).await {
+                    Ok(action) => {
+                        tracing::debug!(
+                            agent_id = %self.agent_id,
+                            "PermitAgent: reason produced action"
+                        );
+                        // Drive the ReAct loop: act on the chosen action
+                        if let Ok(observations) = self.act(&action).await {
+                            if !observations.is_empty() {
+                                let _ = self.respond(&observations).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(agent_id = %self.agent_id, error = ?e, "PermitAgent: reason failed");
+                    }
+                }
+            }
+            AgentMessage::Execute(action) => {
+                if let Err(e) = self.act(&action).await {
+                    tracing::error!(agent_id = %self.agent_id, error = ?e, "PermitAgent: act failed");
+                }
+            }
+            AgentMessage::Respond(observations) => {
+                if let Err(e) = self.respond(&observations).await {
+                    tracing::error!(agent_id = %self.agent_id, error = ?e, "PermitAgent: respond failed");
+                }
+            }
+        }
+    }
+
+}
+
+// ─── pekko_persistence::PersistentActor implementation ──────────────────────
+//
+// Journal events capture every significant state transition so the agent can
+// be replayed from scratch after a restart without loss of in-flight work.
+
+/// Domain events written to the persistence journal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PermitJournalEvent {
+    PermitRequested {
+        request_id: String,
+        facility_id: String,
+        industry: String,
+    },
+    ComplianceChecked {
+        facility_id: String,
+        score: u32,
+    },
+    DocumentGenerated {
+        document_id: String,
+        doc_type: String,
+        facility_id: String,
+    },
+    ApprovalRequested {
+        permit_id: String,
+        approver: String,
+    },
+    PermitCompleted {
+        permit_id: String,
+        issued_date: String,
+    },
+}
+
+/// Full snapshot for fast agent recovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermitAgentSnapshot {
+    pub agent_id: String,
+    pub permit_state: PermitAgentState,
+    pub current_facility: Option<String>,
+    pub industry_type: Option<String>,
+    pub active_permits: Vec<String>,
+}
+
+impl PersistentActor for PermitAgentActor {
+    type Event    = PermitJournalEvent;
+    type State    = PermitAgentState;
+    type Snapshot = PermitAgentSnapshot;
+
+    fn persistence_id(&self) -> String {
+        format!("permit-agent-{}", self.agent_id)
+    }
+
+    async fn receive_recover(
+        &mut self,
+        event: Self::Event,
+        _ctx: &mut PersistentContext<Self>,
+    ) {
+        match event {
+            PermitJournalEvent::PermitRequested { request_id, facility_id, industry } => {
+                self.execution_context.current_facility = Some(facility_id);
+                self.execution_context.industry_type    = Some(industry.clone());
+                self.permit_state = PermitAgentState::AnalyzingRequest {
+                    request_id,
+                    industry,
+                };
+            }
+            PermitJournalEvent::ComplianceChecked { facility_id, .. } => {
+                self.execution_context.current_facility = Some(facility_id);
+                self.permit_state = PermitAgentState::CheckingRegulations {
+                    regulations: vec![
+                        "EPA-40-CFR".to_string(),
+                        "OSHA-29-CFR".to_string(),
+                        "State-Environmental".to_string(),
+                    ],
+                };
+            }
+            PermitJournalEvent::DocumentGenerated { doc_type, facility_id, .. } => {
+                self.permit_state = PermitAgentState::GeneratingDocument {
+                    doc_type,
+                    facility_id,
+                };
+            }
+            PermitJournalEvent::ApprovalRequested { permit_id, approver } => {
+                self.permit_state = PermitAgentState::AwaitingApproval { permit_id, approver };
+            }
+            PermitJournalEvent::PermitCompleted { permit_id, issued_date } => {
+                self.execution_context.active_permits.push(permit_id.clone());
+                self.permit_state = PermitAgentState::Completed { permit_id, issued_date };
+            }
+        }
+    }
+
+    async fn receive_command(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut PersistentContext<Self>,
+    ) {
+        // Delegate to the Actor::receive implementation; event sourcing hooks
+        // (persist, snapshot) can be layered on top as the application matures.
+        match msg {
+            AgentMessage::Query(query) => {
+                if let Ok(action) = self.reason(&query).await {
+                    if let Ok(obs) = self.act(&action).await {
+                        if !obs.is_empty() {
+                            let _ = self.respond(&obs).await;
+                        }
+                    }
+                }
+            }
+            AgentMessage::Execute(action) => { let _ = self.act(&action).await; }
+            AgentMessage::Respond(obs)    => { let _ = self.respond(&obs).await; }
+        }
+    }
+
+    fn apply_event(&mut self, event: &Self::Event) -> Self::State {
+        // Keep a lightweight projection of the current permit state
+        match event {
+            PermitJournalEvent::PermitRequested { request_id, industry, .. } => {
+                PermitAgentState::AnalyzingRequest {
+                    request_id: request_id.clone(),
+                    industry:   industry.clone(),
+                }
+            }
+            PermitJournalEvent::ComplianceChecked { .. } => {
+                PermitAgentState::CheckingRegulations {
+                    regulations: vec![
+                        "EPA-40-CFR".to_string(),
+                        "OSHA-29-CFR".to_string(),
+                        "State-Environmental".to_string(),
+                    ],
+                }
+            }
+            PermitJournalEvent::DocumentGenerated { doc_type, facility_id, .. } => {
+                PermitAgentState::GeneratingDocument {
+                    doc_type:    doc_type.clone(),
+                    facility_id: facility_id.clone(),
+                }
+            }
+            PermitJournalEvent::ApprovalRequested { permit_id, approver } => {
+                PermitAgentState::AwaitingApproval {
+                    permit_id: permit_id.clone(),
+                    approver:  approver.clone(),
+                }
+            }
+            PermitJournalEvent::PermitCompleted { permit_id, issued_date } => {
+                PermitAgentState::Completed {
+                    permit_id:   permit_id.clone(),
+                    issued_date: issued_date.clone(),
+                }
+            }
+        }
+    }
+
+    fn create_snapshot(&self) -> Self::Snapshot {
+        PermitAgentSnapshot {
+            agent_id:        self.agent_id.clone(),
+            permit_state:    self.permit_state.clone(),
+            current_facility: self.execution_context.current_facility.clone(),
+            industry_type:   self.execution_context.industry_type.clone(),
+            active_permits:  self.execution_context.active_permits.clone(),
+        }
+    }
+
+    fn apply_snapshot(&mut self, snapshot: Self::Snapshot) {
+        self.permit_state = snapshot.permit_state;
+        self.execution_context.current_facility = snapshot.current_facility;
+        self.execution_context.industry_type    = snapshot.industry_type;
+        self.execution_context.active_permits   = snapshot.active_permits;
     }
 }

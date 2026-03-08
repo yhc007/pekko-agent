@@ -1,4 +1,5 @@
-use crate::{ClaudeClient, LlmConfig, LlmRequest, LlmResponse, CircuitBreaker};
+use crate::{ClaudeClient, LlmConfig, LlmRequest, LlmResponse};
+use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerError};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,12 +23,17 @@ pub enum LlmError {
     Timeout,
 }
 
-/// LLM Gateway - Central gateway for Claude API access
+/// LLM Gateway — Central gateway for Claude API access.
+///
+/// Uses the production-grade `pekko_actor::CircuitBreaker` (builder pattern,
+/// async `call()`, exponential back-off, statistics) in place of the previous
+/// hand-rolled boolean-state breaker.
 pub struct LlmGateway {
-    client: ClaudeClient,
+    client: Arc<ClaudeClient>,
     #[allow(dead_code)]
     config: LlmConfig,
     token_budget: Arc<AtomicU64>,
+    /// Shared circuit breaker — cheap to clone because the inner state is Arc'd.
     circuit_breaker: CircuitBreaker,
     request_count: AtomicU64,
 }
@@ -35,48 +41,60 @@ pub struct LlmGateway {
 impl LlmGateway {
     pub fn new(config: LlmConfig) -> Self {
         let budget = config.token_budget_daily;
+
+        // Build the circuit breaker with pekko_actor's builder API.
+        let circuit_breaker = CircuitBreaker::new()
+            .max_failures(5)
+            .call_timeout(Duration::from_secs(30))
+            .reset_timeout(Duration::from_secs(60))
+            .max_half_open_calls(1)
+            .exponential_backoff(1.5)
+            .build();
+
         Self {
-            client: ClaudeClient::new(config.clone()),
+            client: Arc::new(ClaudeClient::new(config.clone())),
             config,
             token_budget: Arc::new(AtomicU64::new(budget)),
-            circuit_breaker: CircuitBreaker::new(5, 3, Duration::from_secs(60)),
+            circuit_breaker,
             request_count: AtomicU64::new(0),
         }
     }
 
-    pub async fn call(&mut self, request: LlmRequest) -> Result<LlmResponse, LlmError> {
-        if !self.circuit_breaker.try_acquire() {
-            return Err(LlmError::CircuitOpen);
-        }
-
+    pub async fn call(&self, request: LlmRequest) -> Result<LlmResponse, LlmError> {
+        // Token budget guard (fast path before hitting the circuit breaker).
         let remaining = self.token_budget.load(Ordering::Relaxed);
         if remaining < 1000 {
             return Err(LlmError::TokenBudgetExceeded);
         }
 
-        match self.client.send_message(&request).await {
+        let client = self.client.clone();
+        let token_budget = self.token_budget.clone();
+        let request_count = &self.request_count;
+
+        // Delegate to pekko_actor CircuitBreaker.call(); it handles
+        // Open/HalfOpen/Closed transitions and the call timeout internally.
+        let result = self.circuit_breaker
+            .call(|| async move {
+                client.send_message(&request).await
+                    .map_err(|e| e) // keep ClientError as-is inside the closure
+            })
+            .await;
+
+        match result {
             Ok(response) => {
-                self.circuit_breaker.record_success();
-                self.token_budget.fetch_sub(
-                    response.usage.total() as u64,
-                    Ordering::Relaxed,
-                );
-                self.request_count.fetch_add(1, Ordering::Relaxed);
+                token_budget.fetch_sub(response.usage.total() as u64, Ordering::Relaxed);
+                request_count.fetch_add(1, Ordering::Relaxed);
                 Ok(response)
             }
-            Err(e) => {
-                self.circuit_breaker.record_failure();
+            Err(CircuitBreakerError::Open) => Err(LlmError::CircuitOpen),
+            Err(CircuitBreakerError::Timeout) => Err(LlmError::Timeout),
+            Err(CircuitBreakerError::CallFailed(e)) => {
+                use crate::client::ClientError;
                 Err(match e {
-                    crate::client::ClientError::ApiError { status, body } => {
-                        LlmError::ApiError { status, body }
-                    }
-                    crate::client::ClientError::NetworkError(msg) => {
-                        LlmError::NetworkError(msg)
-                    }
-                    crate::client::ClientError::ParseError(msg) => {
-                        LlmError::ParseError(msg)
-                    }
-                    crate::client::ClientError::Timeout => LlmError::Timeout,
+                    ClientError::ApiError { status, body } => LlmError::ApiError { status, body },
+                    ClientError::NetworkError(msg) => LlmError::NetworkError(msg),
+                    ClientError::ParseError(msg) => LlmError::ParseError(msg),
+                    ClientError::Timeout => LlmError::Timeout,
                 })
             }
         }
@@ -88,5 +106,10 @@ impl LlmGateway {
 
     pub fn total_requests(&self) -> u64 {
         self.request_count.load(Ordering::Relaxed)
+    }
+
+    /// Access circuit-breaker statistics exposed by pekko_actor.
+    pub fn circuit_breaker_stats(&self) -> pekko_actor::CircuitBreakerStats {
+        self.circuit_breaker.stats()
     }
 }

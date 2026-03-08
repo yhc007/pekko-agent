@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 use pekko_agent_core::*;
+use pekko_actor::{Actor, ActorContext};
+use pekko_persistence::{PersistentActor, PersistentContext};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -12,8 +14,9 @@ pub struct InspectionAgentActor {
     execution_context: ExecutionContext,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub enum InspectionAgentState {
+    #[default]
     Idle,
     PreparingInspection {
         facility_id: String,
@@ -502,5 +505,218 @@ impl AgentActor for InspectionAgentActor {
 
     fn transition(&mut self, new_state: AgentState) {
         self.state = new_state;
+    }
+}
+
+// ─── pekko_actor::Actor implementation ──────────────────────────────────────
+
+impl Actor for InspectionAgentActor {
+    type Message = AgentMessage;
+
+    async fn receive(&mut self, msg: AgentMessage, _ctx: &mut ActorContext<Self>) {
+        match msg {
+            AgentMessage::Query(query) => {
+                match self.reason(&query).await {
+                    Ok(action) => {
+                        tracing::debug!(
+                            agent_id = %self.agent_id,
+                            "InspectionAgent: reason produced action"
+                        );
+                        if let Ok(observations) = self.act(&action).await {
+                            if !observations.is_empty() {
+                                let _ = self.respond(&observations).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(agent_id = %self.agent_id, error = ?e, "InspectionAgent: reason failed");
+                    }
+                }
+            }
+            AgentMessage::Execute(action) => {
+                if let Err(e) = self.act(&action).await {
+                    tracing::error!(agent_id = %self.agent_id, error = ?e, "InspectionAgent: act failed");
+                }
+            }
+            AgentMessage::Respond(observations) => {
+                if let Err(e) = self.respond(&observations).await {
+                    tracing::error!(agent_id = %self.agent_id, error = ?e, "InspectionAgent: respond failed");
+                }
+            }
+        }
+    }
+
+}
+
+// ─── pekko_persistence::PersistentActor implementation ──────────────────────
+
+/// Domain events written to the persistence journal for inspection lifecycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum InspectionJournalEvent {
+    InspectionCreated {
+        inspection_id: String,
+        facility_id: String,
+        inspection_type: String,
+    },
+    InspectionScheduled {
+        inspection_id: String,
+        scheduled_start: String,
+        inspector_ids: Vec<String>,
+    },
+    RiskAssessed {
+        facility_id: String,
+        overall_risk_level: String,
+        risk_score: u32,
+    },
+    FindingsDocumented {
+        inspection_id: String,
+        findings_count: u32,
+        critical_count: u32,
+    },
+    InspectionCompleted {
+        inspection_id: String,
+        report_id: String,
+    },
+}
+
+/// Full snapshot for fast inspection agent recovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InspectionAgentSnapshot {
+    pub agent_id: String,
+    pub inspection_state: InspectionAgentState,
+    pub facility_id: Option<String>,
+    pub inspection_type: Option<String>,
+    pub current_findings: Vec<Finding>,
+}
+
+impl PersistentActor for InspectionAgentActor {
+    type Event    = InspectionJournalEvent;
+    type State    = InspectionAgentState;
+    type Snapshot = InspectionAgentSnapshot;
+
+    fn persistence_id(&self) -> String {
+        format!("inspection-agent-{}", self.agent_id)
+    }
+
+    async fn receive_recover(
+        &mut self,
+        event: Self::Event,
+        _ctx: &mut PersistentContext<Self>,
+    ) {
+        match event {
+            InspectionJournalEvent::InspectionCreated { inspection_id: _, facility_id, inspection_type } => {
+                self.execution_context.facility_id = Some(facility_id.clone());
+                self.execution_context.inspection_type = Some(inspection_type.clone());
+                self.inspection_state = InspectionAgentState::PreparingInspection {
+                    facility_id,
+                    inspection_type,
+                };
+            }
+            InspectionJournalEvent::InspectionScheduled { inspection_id: _, scheduled_start, inspector_ids } => {
+                let mut proposed_dates = vec![scheduled_start.clone()];
+                proposed_dates.push(scheduled_start); // placeholder for end date
+                self.inspection_state = InspectionAgentState::SchedulingInspection {
+                    proposed_dates,
+                    inspector_ids,
+                };
+            }
+            InspectionJournalEvent::RiskAssessed { overall_risk_level, risk_score, .. } => {
+                self.inspection_state = InspectionAgentState::AssessingRisk {
+                    risk_level: overall_risk_level,
+                    hazard_count: risk_score as usize,
+                };
+            }
+            InspectionJournalEvent::FindingsDocumented { inspection_id, findings_count, .. } => {
+                self.inspection_state = InspectionAgentState::AwaitingCorrectiveAction {
+                    inspection_id,
+                    deadline: "TBD".to_string(),
+                };
+                // Restore finding count as empty stubs for replay purposes
+                self.execution_context.current_findings = (0..findings_count as usize)
+                    .map(|i| Finding {
+                        finding_id: format!("FIND-{:03}", i + 1),
+                        category: "Recovered".to_string(),
+                        severity: "Unknown".to_string(),
+                        description: "Recovered from journal".to_string(),
+                        location: "Unknown".to_string(),
+                    })
+                    .collect();
+            }
+            InspectionJournalEvent::InspectionCompleted { inspection_id, report_id } => {
+                self.inspection_state = InspectionAgentState::Completed { inspection_id, report_id };
+            }
+        }
+    }
+
+    async fn receive_command(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut PersistentContext<Self>,
+    ) {
+        match msg {
+            AgentMessage::Query(query) => {
+                if let Ok(action) = self.reason(&query).await {
+                    if let Ok(obs) = self.act(&action).await {
+                        if !obs.is_empty() {
+                            let _ = self.respond(&obs).await;
+                        }
+                    }
+                }
+            }
+            AgentMessage::Execute(action) => { let _ = self.act(&action).await; }
+            AgentMessage::Respond(obs)    => { let _ = self.respond(&obs).await; }
+        }
+    }
+
+    fn apply_event(&mut self, event: &Self::Event) -> Self::State {
+        match event {
+            InspectionJournalEvent::InspectionCreated { facility_id, inspection_type, .. } => {
+                InspectionAgentState::PreparingInspection {
+                    facility_id: facility_id.clone(),
+                    inspection_type: inspection_type.clone(),
+                }
+            }
+            InspectionJournalEvent::InspectionScheduled { inspector_ids, scheduled_start, .. } => {
+                InspectionAgentState::SchedulingInspection {
+                    proposed_dates: vec![scheduled_start.clone()],
+                    inspector_ids:  inspector_ids.clone(),
+                }
+            }
+            InspectionJournalEvent::RiskAssessed { overall_risk_level, risk_score, .. } => {
+                InspectionAgentState::AssessingRisk {
+                    risk_level:  overall_risk_level.clone(),
+                    hazard_count: *risk_score as usize,
+                }
+            }
+            InspectionJournalEvent::FindingsDocumented { inspection_id, .. } => {
+                InspectionAgentState::AwaitingCorrectiveAction {
+                    inspection_id: inspection_id.clone(),
+                    deadline:      "TBD".to_string(),
+                }
+            }
+            InspectionJournalEvent::InspectionCompleted { inspection_id, report_id } => {
+                InspectionAgentState::Completed {
+                    inspection_id: inspection_id.clone(),
+                    report_id:     report_id.clone(),
+                }
+            }
+        }
+    }
+
+    fn create_snapshot(&self) -> Self::Snapshot {
+        InspectionAgentSnapshot {
+            agent_id:         self.agent_id.clone(),
+            inspection_state: self.inspection_state.clone(),
+            facility_id:      self.execution_context.facility_id.clone(),
+            inspection_type:  self.execution_context.inspection_type.clone(),
+            current_findings: self.execution_context.current_findings.clone(),
+        }
+    }
+
+    fn apply_snapshot(&mut self, snapshot: Self::Snapshot) {
+        self.inspection_state = snapshot.inspection_state;
+        self.execution_context.facility_id     = snapshot.facility_id;
+        self.execution_context.inspection_type = snapshot.inspection_type;
+        self.execution_context.current_findings = snapshot.current_findings;
     }
 }

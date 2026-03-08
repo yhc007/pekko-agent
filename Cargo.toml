@@ -13,6 +13,9 @@ members = [
     "services/ehs-inspection-agent",
     "services/ehs-compliance-agent",
 ]
+exclude = [
+    "frontend/web-chat",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,6 +24,11 @@ authors = ["pekko-agent team"]
 license = "MIT"
 
 [workspace.dependencies]
+# rust-pekko base crates (path dependencies)
+pekko-actor     = { path = "../rust-pekko/pekko-actor" }
+pekko-persistence = { path = "../rust-pekko/pekko-persistence" }
+pekko-event-bus = { path = "../rust-pekko/pekko-event-bus" }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
@@ -40,12 +48,14 @@ tower-http = { version = "0.5", features = ["cors", "trace"] }
 tonic = "0.12"
 prost = "0.13"
 
-# Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json"] }
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+# Database — coreDB (embedded Cassandra-style NoSQL)
+coredb = { path = "../rust-pekko/coredb" }
 
-# Kafka
-rdkafka = { version = "0.36" }
+# PostgreSQL (EHS 시스템 데이터 조회용)
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json"] }
+
+# Kafka — replaced by pekko-event-bus (embedded, no external Kafka required)
+# rdkafka = { version = "0.36" }
 
 # Auth & Security
 jsonwebtoken = "9"
@@ -62,3 +72,4 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1"
 anyhow = "1"
+dotenvy = "0.15"

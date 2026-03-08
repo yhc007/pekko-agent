@@ -1,71 +1,22 @@
+# ============================================================================
+# pekko-agent Docker Compose (컨테이너 배포용)
+# ============================================================================
+# 로컬 개발은 scripts/run-local.sh 를 사용하세요.
+#
+# 아키텍처:
+#   coreDB      → embedded (in-process)
+#   EventBus    → pekko-event-bus (in-process)
+#   Qdrant      → 외부 (로컬 바이너리 또는 원격 서버)
+#   → Docker에는 인프라 서비스 없음, 애플리케이션 컨테이너만 존재
+#
+# 사용법:
+#   docker compose build
+#   docker compose up -d
+# ============================================================================
+
 version: "3.9"
 
 services:
-  # ── Infrastructure ──
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis-data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: pekko_agent
-      POSTGRES_USER: pekko
-      POSTGRES_PASSWORD: pekko_secret
-    ports:
-      - "5432:5432"
-    volumes:
-      - pg-data:/var/lib/postgresql/data
-      - ./infra/init.sql:/docker-entrypoint-initdb.d/init.sql
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pekko"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
-  qdrant:
-    image: qdrant/qdrant:v1.9.0
-    ports:
-      - "6333:6333"
-      - "6334:6334"
-    volumes:
-      - qdrant-data:/qdrant/storage
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  kafka:
-    image: bitnami/kafka:3.7
-    ports:
-      - "9092:9092"
-    environment:
-      KAFKA_CFG_NODE_ID: 0
-      KAFKA_CFG_PROCESS_ROLES: controller,broker
-      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
-      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
-    volumes:
-      - kafka-data:/bitnami/kafka
-    healthcheck:
-      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
-  # ── Application Services ──
   api-gateway:
     build:
       context: .
@@ -73,19 +24,14 @@ services:
       args:
         SERVICE: api-gateway
     ports:
-      - "8080:8080"
+      - "${API_GATEWAY_PORT:-8080}:8080"
     environment:
-      RUST_LOG: info
+      RUST_LOG: ${RUST_LOG:-info}
       CLAUDE_API_KEY: ${CLAUDE_API_KEY}
-      REDIS_URL: redis://redis:6379
-      DATABASE_URL: postgres://pekko:pekko_secret@postgres:5432/pekko_agent
-      KAFKA_BROKERS: kafka:9092
-      QDRANT_URL: http://qdrant:6333
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
+      COREDB_DATA_DIR: /var/lib/coredb
+      QDRANT_URL: ${QDRANT_URL:-http://host.docker.internal:6333}
+    volumes:
+      - coredb-gateway:/var/lib/coredb
 
   ehs-permit-agent:
     build:
@@ -94,12 +40,14 @@ services:
       args:
         SERVICE: ehs-permit-agent
     ports:
-      - "50055:50055"
+      - "${PERMIT_AGENT_PORT:-50055}:50055"
     environment:
-      RUST_LOG: info
+      RUST_LOG: ${RUST_LOG:-info}
       CLAUDE_API_KEY: ${CLAUDE_API_KEY}
-      REDIS_URL: redis://redis:6379
-      KAFKA_BROKERS: kafka:9092
+      COREDB_DATA_DIR: /var/lib/coredb
+      QDRANT_URL: ${QDRANT_URL:-http://host.docker.internal:6333}
+    volumes:
+      - coredb-permit:/var/lib/coredb
     depends_on:
       - api-gateway
 
@@ -110,12 +58,14 @@ services:
       args:
         SERVICE: ehs-inspection-agent
     ports:
-      - "50056:50056"
+      - "${INSPECTION_AGENT_PORT:-50056}:50056"
     environment:
-      RUST_LOG: info
+      RUST_LOG: ${RUST_LOG:-info}
       CLAUDE_API_KEY: ${CLAUDE_API_KEY}
-      REDIS_URL: redis://redis:6379
-      KAFKA_BROKERS: kafka:9092
+      COREDB_DATA_DIR: /var/lib/coredb
+      QDRANT_URL: ${QDRANT_URL:-http://host.docker.internal:6333}
+    volumes:
+      - coredb-inspection:/var/lib/coredb
     depends_on:
       - api-gateway
 
@@ -126,17 +76,19 @@ services:
       args:
         SERVICE: ehs-compliance-agent
     ports:
-      - "50057:50057"
+      - "${COMPLIANCE_AGENT_PORT:-50057}:50057"
     environment:
-      RUST_LOG: info
+      RUST_LOG: ${RUST_LOG:-info}
       CLAUDE_API_KEY: ${CLAUDE_API_KEY}
-      REDIS_URL: redis://redis:6379
-      KAFKA_BROKERS: kafka:9092
+      COREDB_DATA_DIR: /var/lib/coredb
+      QDRANT_URL: ${QDRANT_URL:-http://host.docker.internal:6333}
+    volumes:
+      - coredb-compliance:/var/lib/coredb
     depends_on:
       - api-gateway
 
 volumes:
-  redis-data:
-  pg-data:
-  qdrant-data:
-  kafka-data:
+  coredb-gateway:
+  coredb-permit:
+  coredb-inspection:
+  coredb-compliance:

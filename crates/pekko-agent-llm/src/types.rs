@@ -108,7 +108,7 @@ impl Default for LlmConfig {
             max_tokens: 4096,
             temperature: 0.7,
             timeout_secs: 60,
-            max_retries: 3,
+            max_retries: 5,
             rate_limit_rpm: 1000,
             token_budget_daily: 1_000_000,
         }
