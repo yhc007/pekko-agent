@@ -100,6 +100,11 @@ pub enum OrchestratorMessage {
         user_id:    String,
         event_tx:   mpsc::UnboundedSender<String>,
     },
+
+    /// Read-only query: returns a snapshot of the registered agent list.
+    GetAgents {
+        reply_to: oneshot::Sender<Vec<AgentInfo>>,
+    },
 }
 
 impl fmt::Debug for OrchestratorMessage {
@@ -115,6 +120,8 @@ impl fmt::Debug for OrchestratorMessage {
                 write!(f, "QueryAgent(agent={agent_id}, session={session_id})"),
             Self::StreamAgent { agent_id, session_id, .. } =>
                 write!(f, "StreamAgent(agent={agent_id}, session={session_id})"),
+            Self::GetAgents { .. } =>
+                write!(f, "GetAgents"),
         }
     }
 }
@@ -194,11 +201,13 @@ impl Actor for OrchestratorActor {
                 Box::pin(async {})
             }
 
-            // ── Async query messages ──
+            // ── Query messages: spawned in separate tokio tasks so the actor
+            //    mailbox is never blocked during long LLM calls ──
+
             OrchestratorMessage::QueryAgent {
                 agent_id, content, session_id, tenant_id, user_id, reply_to,
             } => {
-                // Clone Arc deps so the future owns them (no borrow of self)
+                // Clone Arc deps before the async block — future is Send + 'static
                 let conv   = self.deps.conversation_store.clone();
                 let tools  = self.deps.tool_registry.clone();
                 let claude = self.deps.claude_client.clone();
@@ -207,13 +216,15 @@ impl Actor for OrchestratorActor {
                 let cfg    = self.deps.llm_config.clone();
                 let prov   = self.deps.llm_provider.clone();
 
-                Box::pin(async move {
+                // Spawn so actor is free immediately for next message
+                tokio::spawn(async move {
                     let result = run_query_loop(
                         agent_id, content, session_id, tenant_id, user_id,
                         conv, tools, claude, gemini, openai, cfg, prov,
                     ).await;
                     let _ = reply_to.send(result);
-                })
+                });
+                Box::pin(async {})
             }
 
             OrchestratorMessage::StreamAgent {
@@ -227,14 +238,22 @@ impl Actor for OrchestratorActor {
                 let cfg    = self.deps.llm_config.clone();
                 let prov   = self.deps.llm_provider.clone();
 
-                Box::pin(async move {
+                // Spawn so actor is free immediately; event_tx drop closes SSE stream
+                tokio::spawn(async move {
                     run_stream_loop(
                         agent_id, content, session_id, tenant_id, user_id,
                         conv, tools, claude, gemini, openai, cfg, prov,
                         event_tx,
                     ).await;
-                    // event_tx dropped here → SSE stream closes
-                })
+                });
+                Box::pin(async {})
+            }
+
+            // ── Read-only: snapshot of agent registry ──
+            OrchestratorMessage::GetAgents { reply_to } => {
+                let agents: Vec<AgentInfo> = self.agent_registry.values().cloned().collect();
+                let _ = reply_to.send(agents);
+                Box::pin(async {})
             }
         }
     }
@@ -588,12 +607,6 @@ async fn run_query_loop(
 
 // ─── Streaming query loop ─────────────────────────────────────────────────────
 
-macro_rules! emit {
-    ($tx:expr, $($tt:tt)*) => {
-        let _ = $tx.send(serde_json::json!($($tt)*).to_string());
-    };
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_stream_loop(
     agent_id:   String,
@@ -610,6 +623,8 @@ async fn run_stream_loop(
     provider:   String,
     tx:         mpsc::UnboundedSender<String>,
 ) {
+    // Inline closure replaces module-level macro — scoped to this function
+    let emit = |v: serde_json::Value| { let _ = tx.send(v.to_string()); };
     let _ = conv.append_message(&session_id, Message::user(&content)).await;
 
     let history: Vec<Message> = conv.get_conversation(&session_id).await.unwrap_or_default();
@@ -631,7 +646,7 @@ async fn run_stream_loop(
     let mut final_text = String::new();
 
     'outer: for round in 0..MAX_TOOL_ROUNDS {
-        emit!(tx, {"type": "thinking", "round": round});
+        emit(serde_json::json!({"type": "thinking", "round": round}));
 
         let req = LlmRequest {
             system_prompt: system_prompt.clone(),
@@ -649,7 +664,7 @@ async fn run_stream_loop(
             openai.as_deref(),
         ).await {
             Ok(r)  => r,
-            Err(e) => { emit!(tx, {"type":"error","message": e}); break 'outer; }
+            Err(e) => { emit(serde_json::json!({"type":"error","message": e})); break 'outer; }
         };
 
         total_input  += resp.usage.input_tokens;
@@ -685,7 +700,7 @@ async fn run_stream_loop(
             let mut tool_results = Vec::new();
 
             for (tool_use_id, tool_name, tool_input) in &tool_uses {
-                emit!(tx, {"type": "tool_use", "tool": tool_name, "round": round});
+                emit(serde_json::json!({"type": "tool_use", "tool": tool_name, "round": round}));
                 all_tools_used.push(tool_name.clone());
 
                 let result = {
@@ -707,7 +722,7 @@ async fn run_stream_loop(
                     }
                 };
 
-                emit!(tx, {"type": "tool_result", "tool": tool_name, "ok": ok});
+                emit(serde_json::json!({"type": "tool_result", "tool": tool_name, "ok": ok}));
                 tool_results.push(ContentBlock::ToolResult {
                     tool_use_id: tool_use_id.clone(),
                     content: content_str,
@@ -730,12 +745,12 @@ async fn run_stream_loop(
     let _ = conv.append_message(&session_id, Message::assistant(&final_text)).await;
     all_tools_used.sort(); all_tools_used.dedup();
 
-    emit!(tx, {"type": "text_chunk", "text": final_text});
-    emit!(tx, {
+    emit(serde_json::json!({"type": "text_chunk", "text": final_text}));
+    emit(serde_json::json!({
         "type": "done",
         "session_id": session_id,
         "tools_used": all_tools_used,
         "input_tokens": total_input,
         "output_tokens": total_output
-    });
+    }));
 }

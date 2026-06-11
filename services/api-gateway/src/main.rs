@@ -15,27 +15,22 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use tracing::{info, error};
 
-use pekko_actor::{ActorRef, ActorSystem};
-use pekko_agent_core::{Message, TokenUsage, ShortTermMemory, AgentInfo, AgentStatus};
+use pekko_actor::ActorRef;
+use pekko_agent_core::{TokenUsage, ShortTermMemory, AgentInfo, AgentStatus};
 use pekko_agent_llm::{LlmConfig, ClaudeClient, GeminiClient, OpenAIClient};
 use pekko_agent_tools::{ToolRegistry, builtin::{PermitSearchTool, ComplianceCheckTool, EhsQueryTool}};
-use pekko_agent_memory::{PgConversationStore, InMemoryVectorStore, InMemoryEpisodicStore};
+use pekko_agent_memory::PgConversationStore;
 use pekko_agent_orchestrator::{OrchestratorActor, OrchestratorDeps, OrchestratorMessage};
 use pekko_agent_events::EventPublisher;
-use pekko_agent_security::{RbacManager, TenantManager, AuditLogger};
+use pekko_agent_security::AuditLogger;
 use sqlx::PgPool;
 
 /// Shared application state
 #[derive(Clone)]
 struct AppState {
-    // Direct-access handles (for /api/tools, /api/agents, /api/sessions/*)
     tool_registry:      Arc<RwLock<ToolRegistry>>,
     conversation_store: Arc<PgConversationStore>,
-    registered_agents:  Vec<AgentInfo>,
-    // The real Actor system
-    actor_system:       ActorSystem,
     orchestrator_ref:   ActorRef<OrchestratorActor>,
-    // Infrastructure
     event_publisher:    Arc<EventPublisher>,
     audit_logger:       Arc<AuditLogger>,
 }
@@ -104,20 +99,39 @@ fn service_unavailable(msg: impl Into<String>) -> (StatusCode, Json<ErrorRespons
 /// GET /api/health
 async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     let tool_count = state.tool_registry.read().await.list_tools().len();
+
+    let (reply_tx, reply_rx) = oneshot::channel::<Vec<AgentInfo>>();
+    let agent_count = if state.orchestrator_ref
+        .tell(OrchestratorMessage::GetAgents { reply_to: reply_tx })
+        .is_ok()
+    {
+        reply_rx.await.map(|v| v.len()).unwrap_or(0)
+    } else {
+        0
+    };
+
     Json(HealthResponse {
         status:  "healthy".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         services: ServiceStatus {
             orchestrator:     "running".to_string(),
             tools_registered: tool_count,
-            active_agents:    state.registered_agents.len(),
+            active_agents:    agent_count,
         },
     })
 }
 
 /// GET /api/agents
-async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.registered_agents.clone())
+async fn list_agents(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<AgentInfo>>, (StatusCode, Json<ErrorResponse>)> {
+    let (reply_tx, reply_rx) = oneshot::channel::<Vec<AgentInfo>>();
+    state.orchestrator_ref
+        .tell(OrchestratorMessage::GetAgents { reply_to: reply_tx })
+        .map_err(|_| service_unavailable("Orchestrator actor unavailable"))?;
+    let agents = reply_rx.await
+        .map_err(|_| internal_error("Orchestrator did not reply"))?;
+    Ok(Json(agents))
 }
 
 /// POST /api/agents/:agent_id/query  — blocking, returns full response
@@ -316,7 +330,7 @@ async fn main() -> anyhow::Result<()> {
     ];
 
     // ── ActorSystem + OrchestratorActor ──
-    let actor_system = ActorSystem::new("pekko-agent");
+    let actor_system = pekko_actor::ActorSystem::new("pekko-agent");
 
     let deps = OrchestratorDeps {
         conversation_store: conversation_store.clone(),
@@ -347,12 +361,13 @@ async fn main() -> anyhow::Result<()> {
     let event_publisher = Arc::new(EventPublisher::new("pekko-agent", 1024));
     let audit_logger    = Arc::new(AuditLogger::new(10000));
 
+    // actor_system and registered_agents are local — not needed in AppState
+    drop(registered_agents);
+
     // ── AppState ──
     let state = AppState {
         tool_registry,
         conversation_store,
-        registered_agents,
-        actor_system,
         orchestrator_ref,
         event_publisher,
         audit_logger,
