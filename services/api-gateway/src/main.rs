@@ -1,5 +1,6 @@
 use axum::{
     extract::{Path, State, Json},
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
     routing::{get, post},
     Router,
     http::StatusCode,
@@ -7,8 +8,10 @@ use axum::{
 };
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+use tower_http::timeout::TimeoutLayer;
 use std::sync::Arc;
 use std::convert::Infallible;
+use std::time::Duration;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use futures::stream;
 use serde::{Deserialize, Serialize};
@@ -25,7 +28,12 @@ use pekko_agent_events::EventPublisher;
 use pekko_agent_security::AuditLogger;
 use sqlx::PgPool;
 
-/// Shared application state
+// ── Timeouts ──────────────────────────────────────────────────────────────────
+// Applied to blocking routes only. Streaming routes (SSE, WS) have no
+// response-body timeout since the connection is intentionally long-lived.
+const BLOCKING_TIMEOUT: Duration = Duration::from_secs(60);
+
+// ── Shared application state ──────────────────────────────────────────────────
 #[derive(Clone)]
 struct AppState {
     tool_registry:      Arc<RwLock<ToolRegistry>>,
@@ -35,7 +43,7 @@ struct AppState {
     audit_logger:       Arc<AuditLogger>,
 }
 
-/// Request payload for agent queries
+// ── Request / Response types ──────────────────────────────────────────────────
 #[derive(Deserialize)]
 struct QueryRequest {
     content: String,
@@ -47,10 +55,21 @@ struct QueryRequest {
     user_id: String,
 }
 
+/// Incoming WebSocket message from the client.
+#[derive(Deserialize)]
+struct WsQueryRequest {
+    content: String,
+    #[serde(default)]
+    session_id: Option<Uuid>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
+}
+
 fn default_tenant() -> String { "default".to_string() }
 fn default_user()   -> String { "anonymous".to_string() }
 
-/// Response from agent query
 #[derive(Serialize)]
 struct QueryResponse {
     session_id:  Uuid,
@@ -80,6 +99,7 @@ struct ErrorResponse {
     code:  String,
 }
 
+// ── Error helpers ──────────────────────────────────────────────────────────────
 fn internal_error(msg: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
     let msg = msg.into();
     error!("{}", msg);
@@ -95,6 +115,8 @@ fn service_unavailable(msg: impl Into<String>) -> (StatusCode, Json<ErrorRespons
         code: "ACTOR_UNAVAILABLE".into(),
     }))
 }
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
 
 /// GET /api/health
 async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
@@ -134,7 +156,7 @@ async fn list_agents(
     Ok(Json(agents))
 }
 
-/// POST /api/agents/:agent_id/query  — blocking, returns full response
+/// POST /api/agents/:agent_id/query  — blocking request-reply
 async fn query_agent(
     Path(agent_id): Path<String>,
     State(state):   State<AppState>,
@@ -144,7 +166,6 @@ async fn query_agent(
 
     info!(agent_id = %agent_id, session_id = %session_id, "Agent query → OrchestratorActor");
 
-    // Publish audit event
     let event = pekko_agent_events::AgentEventEnvelope::new(
         "api-gateway",
         pekko_agent_events::event_types::TASK_ASSIGNED,
@@ -155,7 +176,7 @@ async fn query_agent(
     let _ = state.event_publisher.publish(event).await;
 
     state.audit_logger.log(pekko_agent_security::AuditEntry {
-        id: Uuid::new_v4(),
+        id:        Uuid::new_v4(),
         timestamp: chrono::Utc::now(),
         tenant_id: req.tenant_id.clone(),
         agent_id:  agent_id.clone(),
@@ -165,9 +186,7 @@ async fn query_agent(
         details:   serde_json::json!({ "session_id": session_id }),
     }).await;
 
-    // Build oneshot channel for reply
     let (reply_tx, reply_rx) = oneshot::channel();
-
     state.orchestrator_ref
         .tell(OrchestratorMessage::QueryAgent {
             agent_id:   agent_id.clone(),
@@ -179,7 +198,6 @@ async fn query_agent(
         })
         .map_err(|_| service_unavailable("Orchestrator actor unavailable"))?;
 
-    // Await the actor's reply
     let result = reply_rx.await
         .map_err(|_| internal_error("Orchestrator did not reply"))?
         .map_err(|e| internal_error(format!("Query failed: {e}")))?;
@@ -197,6 +215,9 @@ async fn query_agent(
 }
 
 /// POST /api/agents/:agent_id/query/stream  — SSE streaming
+///
+/// Uses a bounded channel (256) so a slow browser can apply backpressure.
+/// No TimeoutLayer here — the connection is intentionally long-lived.
 async fn stream_query_agent(
     Path(agent_id): Path<String>,
     State(state):   State<AppState>,
@@ -206,19 +227,21 @@ async fn stream_query_agent(
 
     info!(agent_id = %agent_id, session_id = %session_id, "SSE stream → OrchestratorActor");
 
-    let (event_tx, event_rx) = mpsc::unbounded_channel::<String>();
+    // Bounded: if the browser stalls, the actor's emit_event().await yields,
+    // creating natural backpressure instead of unbounded memory growth.
+    let (event_tx, event_rx) = mpsc::channel::<String>(256);
 
     let result = state.orchestrator_ref.tell(OrchestratorMessage::StreamAgent {
         agent_id,
-        content:    req.content,
+        content:   req.content,
         session_id,
-        tenant_id:  req.tenant_id,
-        user_id:    req.user_id,
-        event_tx:   event_tx.clone(),
+        tenant_id: req.tenant_id,
+        user_id:   req.user_id,
+        event_tx:  event_tx.clone(),
     });
 
-    if let Err(_) = result {
-        let _ = event_tx.send(
+    if result.is_err() {
+        let _ = event_tx.try_send(
             serde_json::json!({"type":"error","message":"Orchestrator actor unavailable"}).to_string()
         );
     }
@@ -230,6 +253,86 @@ async fn stream_query_agent(
     });
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// GET /api/agents/:agent_id/ws  — WebSocket bidirectional streaming
+///
+/// Protocol:
+///   Client → Server: JSON `{"content":"...", "session_id":"<uuid>", ...}`
+///   Server → Client: same JSON event stream as SSE
+///                    (thinking / tool_use / tool_result / text_chunk / done / error)
+///
+/// Multiple queries per connection are supported — send a new JSON message
+/// after receiving `{"type":"done", ...}` from the previous one.
+async fn ws_agent(
+    Path(agent_id): Path<String>,
+    State(state):   State<AppState>,
+    ws:             WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| ws_agent_handler(socket, state, agent_id))
+}
+
+async fn ws_agent_handler(mut socket: WebSocket, state: AppState, agent_id: String) {
+    info!(agent_id = %agent_id, "WebSocket connection opened");
+
+    loop {
+        // Wait for a query from the client
+        let msg = match socket.recv().await {
+            Some(Ok(m))  => m,
+            Some(Err(e)) => { error!(error = %e, "WS recv error"); break; }
+            None         => break, // Connection closed
+        };
+
+        let text = match msg {
+            Message::Text(t)  => t,
+            Message::Close(_) => break,
+            // axum 0.7 auto-responds to Ping with Pong; skip other frames
+            _ => continue,
+        };
+
+        let req: WsQueryRequest = match serde_json::from_str(&text) {
+            Ok(r)  => r,
+            Err(e) => {
+                let err = serde_json::json!({"type":"error","message": format!("Invalid JSON: {e}")}).to_string();
+                let _ = socket.send(Message::Text(err)).await;
+                continue;
+            }
+        };
+
+        let session_id = req.session_id.unwrap_or_else(Uuid::new_v4);
+        let tenant_id  = req.tenant_id.unwrap_or_else(default_tenant);
+        let user_id    = req.user_id.unwrap_or_else(default_user);
+
+        info!(agent_id = %agent_id, session_id = %session_id, "WS query received");
+
+        let (event_tx, mut event_rx) = mpsc::channel::<String>(256);
+
+        let result = state.orchestrator_ref.tell(OrchestratorMessage::StreamAgent {
+            agent_id:  agent_id.clone(),
+            content:   req.content,
+            session_id,
+            tenant_id,
+            user_id,
+            event_tx,
+        });
+
+        if result.is_err() {
+            let err = serde_json::json!({"type":"error","message":"Orchestrator actor unavailable"}).to_string();
+            let _ = socket.send(Message::Text(err)).await;
+            continue;
+        }
+
+        // Forward every event from the actor to the WebSocket client.
+        // Stops early if the client disconnects.
+        while let Some(data) = event_rx.recv().await {
+            if socket.send(Message::Text(data)).await.is_err() {
+                info!(agent_id = %agent_id, "WS client disconnected mid-stream");
+                return;
+            }
+        }
+    }
+
+    info!(agent_id = %agent_id, "WebSocket connection closed");
 }
 
 /// GET /api/sessions/:session_id/history
@@ -250,6 +353,7 @@ async fn list_tools(State(state): State<AppState>) -> impl IntoResponse {
     Json(registry.list_tools())
 }
 
+// ── Main ──────────────────────────────────────────────────────────────────────
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -260,7 +364,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting pekko-agent API Gateway");
 
-    // ── LLM config ──
+    // ── LLM config ────────────────────────────────────────────────────────────
     let llm_config = LlmConfig {
         api_key: std::env::var("CLAUDE_API_KEY")
             .expect("CLAUDE_API_KEY must be set"),
@@ -282,7 +386,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(OpenAIClient::new(key, std::env::var("OPENAI_MODEL").ok()))
     });
 
-    // ── PostgreSQL ──
+    // ── PostgreSQL ────────────────────────────────────────────────────────────
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://paulyu@localhost:5432/astgroup".to_string());
     let pg_pool = Arc::new(
@@ -296,7 +400,7 @@ async fn main() -> anyhow::Result<()> {
 
     let conversation_store = Arc::new(PgConversationStore::new(pg_pool.clone(), 100));
 
-    // ── Tool registry ──
+    // ── Tool registry ─────────────────────────────────────────────────────────
     let mut tool_registry = ToolRegistry::new();
     tool_registry.register(Arc::new(PermitSearchTool::new(pg_pool.clone())));
     tool_registry.register(Arc::new(ComplianceCheckTool::new(pg_pool.clone())));
@@ -304,8 +408,25 @@ async fn main() -> anyhow::Result<()> {
     let tool_registry = Arc::new(RwLock::new(tool_registry));
     info!(tools = tool_registry.read().await.list_tools().len(), "Tool registry ready");
 
-    // ── Agent registry ──
-    let registered_agents = vec![
+    // ── ActorSystem + OrchestratorActor ───────────────────────────────────────
+    let actor_system = pekko_actor::ActorSystem::new("pekko-agent");
+
+    let deps = OrchestratorDeps {
+        conversation_store: conversation_store.clone(),
+        tool_registry:      tool_registry.clone(),
+        claude_client,
+        gemini_client,
+        openai_client,
+        llm_config,
+        llm_provider,
+    };
+
+    let orchestrator_ref = actor_system
+        .spawn(OrchestratorActor::new(deps), "orchestrator").await
+        .expect("Failed to spawn OrchestratorActor");
+
+    // Register agents via Actor messages (actor is the single source of truth)
+    let agents = [
         AgentInfo {
             agent_id:     "ehs-permit-agent".into(),
             agent_type:   "ehs".into(),
@@ -329,42 +450,16 @@ async fn main() -> anyhow::Result<()> {
         },
     ];
 
-    // ── ActorSystem + OrchestratorActor ──
-    let actor_system = pekko_actor::ActorSystem::new("pekko-agent");
-
-    let deps = OrchestratorDeps {
-        conversation_store: conversation_store.clone(),
-        tool_registry:      tool_registry.clone(),
-        claude_client:      claude_client.clone(),
-        gemini_client:      gemini_client.clone(),
-        openai_client:      openai_client.clone(),
-        llm_config:         llm_config.clone(),
-        llm_provider:       llm_provider.clone(),
-    };
-
-    let orchestrator = OrchestratorActor::new(deps);
-    let orchestrator_ref = actor_system.spawn(orchestrator, "orchestrator").await
-        .expect("Failed to spawn OrchestratorActor");
-
-    // Register agents via Actor messages
-    for agent in &registered_agents {
+    for agent in &agents {
         orchestrator_ref.tell(OrchestratorMessage::RegisterAgent(agent.clone()))
             .expect("Failed to send RegisterAgent");
     }
+    info!(agents = agents.len(), "OrchestratorActor spawned in ActorSystem");
 
-    info!(
-        agents = registered_agents.len(),
-        "OrchestratorActor spawned in ActorSystem"
-    );
-
-    // ── Infrastructure ──
+    // ── Infrastructure ────────────────────────────────────────────────────────
     let event_publisher = Arc::new(EventPublisher::new("pekko-agent", 1024));
     let audit_logger    = Arc::new(AuditLogger::new(10000));
 
-    // actor_system and registered_agents are local — not needed in AppState
-    drop(registered_agents);
-
-    // ── AppState ──
     let state = AppState {
         tool_registry,
         conversation_store,
@@ -373,24 +468,36 @@ async fn main() -> anyhow::Result<()> {
         audit_logger,
     };
 
-    // ── Router ──
+    // ── Router ────────────────────────────────────────────────────────────────
+    //
+    // Blocking routes → wrapped with TimeoutLayer (60 s).
+    // Streaming routes (SSE, WS) → no response timeout; connection is long-lived.
+    //
+    let blocking = Router::new()
+        .route("/api/health",                        get(health_check))
+        .route("/api/agents",                        get(list_agents))
+        .route("/api/agents/:agent_id/query",        post(query_agent))
+        .route("/api/sessions/:session_id/history",  get(get_session_history))
+        .route("/api/tools",                         get(list_tools))
+        .layer(TimeoutLayer::new(BLOCKING_TIMEOUT));
+
+    let streaming = Router::new()
+        .route("/api/agents/:agent_id/query/stream", post(stream_query_agent))
+        .route("/api/agents/:agent_id/ws",           get(ws_agent));
+
     let port: u16 = std::env::var("API_GATEWAY_PORT")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(8080);
 
     let app = Router::new()
-        .route("/api/health",                         get(health_check))
-        .route("/api/agents",                         get(list_agents))
-        .route("/api/agents/:agent_id/query",         post(query_agent))
-        .route("/api/agents/:agent_id/query/stream",  post(stream_query_agent))
-        .route("/api/sessions/:session_id/history",   get(get_session_history))
-        .route("/api/tools",                          get(list_tools))
+        .merge(blocking)
+        .merge(streaming)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!("API Gateway listening on {addr}");
+    info!(%addr, "API Gateway listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

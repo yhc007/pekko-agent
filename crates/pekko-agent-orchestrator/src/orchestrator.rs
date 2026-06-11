@@ -11,10 +11,10 @@
 //! orch_ref.tell(OrchestratorMessage::QueryAgent { agent_id: "ehs-permit-agent".into(), ..., reply_to: tx })?;
 //! let result = rx.await??;
 //!
-//! // Stream (events via mpsc)
-//! let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+//! // Stream (events via bounded mpsc — backpressure built-in)
+//! let (tx, rx) = tokio::sync::mpsc::channel(256);
 //! orch_ref.tell(OrchestratorMessage::StreamAgent { ..., event_tx: tx })?;
-//! while let Some(json) = rx.recv().await { /* SSE */ }
+//! while let Some(json) = rx.recv().await { /* SSE / WebSocket */ }
 //! ```
 
 use std::collections::{HashMap, VecDeque};
@@ -98,7 +98,8 @@ pub enum OrchestratorMessage {
         session_id: Uuid,
         tenant_id:  String,
         user_id:    String,
-        event_tx:   mpsc::UnboundedSender<String>,
+        /// Bounded — provides backpressure so slow consumers don't inflate memory.
+        event_tx:   mpsc::Sender<String>,
     },
 
     /// Read-only query: returns a snapshot of the registered agent list.
@@ -605,6 +606,15 @@ async fn run_query_loop(
     })
 }
 
+// ─── Streaming helpers ────────────────────────────────────────────────────────
+
+/// Send one JSON event into the bounded channel.
+/// Awaits when the buffer is full, providing natural backpressure.
+/// Silently drops if the consumer (SSE/WS client) has disconnected.
+async fn emit_event(tx: &mpsc::Sender<String>, v: serde_json::Value) {
+    let _ = tx.send(v.to_string()).await;
+}
+
 // ─── Streaming query loop ─────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -621,10 +631,8 @@ async fn run_stream_loop(
     openai:     Option<Arc<OpenAIClient>>,
     cfg:        LlmConfig,
     provider:   String,
-    tx:         mpsc::UnboundedSender<String>,
+    tx:         mpsc::Sender<String>,
 ) {
-    // Inline closure replaces module-level macro — scoped to this function
-    let emit = |v: serde_json::Value| { let _ = tx.send(v.to_string()); };
     let _ = conv.append_message(&session_id, Message::user(&content)).await;
 
     let history: Vec<Message> = conv.get_conversation(&session_id).await.unwrap_or_default();
@@ -646,7 +654,7 @@ async fn run_stream_loop(
     let mut final_text = String::new();
 
     'outer: for round in 0..MAX_TOOL_ROUNDS {
-        emit(serde_json::json!({"type": "thinking", "round": round}));
+        emit_event(&tx, serde_json::json!({"type": "thinking", "round": round})).await;
 
         let req = LlmRequest {
             system_prompt: system_prompt.clone(),
@@ -664,7 +672,7 @@ async fn run_stream_loop(
             openai.as_deref(),
         ).await {
             Ok(r)  => r,
-            Err(e) => { emit(serde_json::json!({"type":"error","message": e})); break 'outer; }
+            Err(e) => { emit_event(&tx, serde_json::json!({"type":"error","message": e})).await; break 'outer; }
         };
 
         total_input  += resp.usage.input_tokens;
@@ -700,7 +708,7 @@ async fn run_stream_loop(
             let mut tool_results = Vec::new();
 
             for (tool_use_id, tool_name, tool_input) in &tool_uses {
-                emit(serde_json::json!({"type": "tool_use", "tool": tool_name, "round": round}));
+                emit_event(&tx, serde_json::json!({"type": "tool_use", "tool": tool_name, "round": round})).await;
                 all_tools_used.push(tool_name.clone());
 
                 let result = {
@@ -722,7 +730,7 @@ async fn run_stream_loop(
                     }
                 };
 
-                emit(serde_json::json!({"type": "tool_result", "tool": tool_name, "ok": ok}));
+                emit_event(&tx, serde_json::json!({"type": "tool_result", "tool": tool_name, "ok": ok})).await;
                 tool_results.push(ContentBlock::ToolResult {
                     tool_use_id: tool_use_id.clone(),
                     content: content_str,
@@ -745,12 +753,12 @@ async fn run_stream_loop(
     let _ = conv.append_message(&session_id, Message::assistant(&final_text)).await;
     all_tools_used.sort(); all_tools_used.dedup();
 
-    emit(serde_json::json!({"type": "text_chunk", "text": final_text}));
-    emit(serde_json::json!({
+    emit_event(&tx, serde_json::json!({"type": "text_chunk", "text": final_text})).await;
+    emit_event(&tx, serde_json::json!({
         "type": "done",
         "session_id": session_id,
         "tools_used": all_tools_used,
         "input_tokens": total_input,
         "output_tokens": total_output
-    }));
+    })).await;
 }
