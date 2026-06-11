@@ -475,38 +475,39 @@ impl AgentActor for PermitAgentActor {
 impl Actor for PermitAgentActor {
     type Message = AgentMessage;
 
-    async fn receive(&mut self, msg: AgentMessage, _ctx: &mut ActorContext<Self>) {
-        match msg {
-            AgentMessage::Query(query) => {
-                match self.reason(&query).await {
-                    Ok(action) => {
-                        tracing::debug!(
-                            agent_id = %self.agent_id,
-                            "PermitAgent: reason produced action"
-                        );
-                        // Drive the ReAct loop: act on the chosen action
-                        if let Ok(observations) = self.act(&action).await {
-                            if !observations.is_empty() {
-                                let _ = self.respond(&observations).await;
+    fn receive(&mut self, msg: AgentMessage, _ctx: &mut ActorContext<Self>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            match msg {
+                AgentMessage::Query(query) => {
+                    match self.reason(&query).await {
+                        Ok(action) => {
+                            tracing::debug!(
+                                agent_id = %self.agent_id,
+                                "PermitAgent: reason produced action"
+                            );
+                            if let Ok(observations) = self.act(&action).await {
+                                if !observations.is_empty() {
+                                    let _ = self.respond(&observations).await;
+                                }
                             }
                         }
+                        Err(e) => {
+                            tracing::error!(agent_id = %self.agent_id, error = ?e, "PermitAgent: reason failed");
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!(agent_id = %self.agent_id, error = ?e, "PermitAgent: reason failed");
+                }
+                AgentMessage::Execute(action) => {
+                    if let Err(e) = self.act(&action).await {
+                        tracing::error!(agent_id = %self.agent_id, error = ?e, "PermitAgent: act failed");
+                    }
+                }
+                AgentMessage::Respond(observations) => {
+                    if let Err(e) = self.respond(&observations).await {
+                        tracing::error!(agent_id = %self.agent_id, error = ?e, "PermitAgent: respond failed");
                     }
                 }
             }
-            AgentMessage::Execute(action) => {
-                if let Err(e) = self.act(&action).await {
-                    tracing::error!(agent_id = %self.agent_id, error = ?e, "PermitAgent: act failed");
-                }
-            }
-            AgentMessage::Respond(observations) => {
-                if let Err(e) = self.respond(&observations).await {
-                    tracing::error!(agent_id = %self.agent_id, error = ?e, "PermitAgent: respond failed");
-                }
-            }
-        }
+        })
     }
 
 }
@@ -553,6 +554,7 @@ pub struct PermitAgentSnapshot {
     pub active_permits: Vec<String>,
 }
 
+#[async_trait::async_trait]
 impl PersistentActor for PermitAgentActor {
     type Event    = PermitJournalEvent;
     type State    = PermitAgentState;

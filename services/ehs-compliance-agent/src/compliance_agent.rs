@@ -595,37 +595,39 @@ impl AgentActor for ComplianceAgentActor {
 impl Actor for ComplianceAgentActor {
     type Message = AgentMessage;
 
-    async fn receive(&mut self, msg: AgentMessage, _ctx: &mut ActorContext<Self>) {
-        match msg {
-            AgentMessage::Query(query) => {
-                match self.reason(&query).await {
-                    Ok(action) => {
-                        tracing::debug!(
-                            agent_id = %self.agent_id,
-                            "ComplianceAgent: reason produced action"
-                        );
-                        if let Ok(observations) = self.act(&action).await {
-                            if !observations.is_empty() {
-                                let _ = self.respond(&observations).await;
+    fn receive(&mut self, msg: AgentMessage, _ctx: &mut ActorContext<Self>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            match msg {
+                AgentMessage::Query(query) => {
+                    match self.reason(&query).await {
+                        Ok(action) => {
+                            tracing::debug!(
+                                agent_id = %self.agent_id,
+                                "ComplianceAgent: reason produced action"
+                            );
+                            if let Ok(observations) = self.act(&action).await {
+                                if !observations.is_empty() {
+                                    let _ = self.respond(&observations).await;
+                                }
                             }
                         }
+                        Err(e) => {
+                            tracing::error!(agent_id = %self.agent_id, error = ?e, "ComplianceAgent: reason failed");
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!(agent_id = %self.agent_id, error = ?e, "ComplianceAgent: reason failed");
+                }
+                AgentMessage::Execute(action) => {
+                    if let Err(e) = self.act(&action).await {
+                        tracing::error!(agent_id = %self.agent_id, error = ?e, "ComplianceAgent: act failed");
+                    }
+                }
+                AgentMessage::Respond(observations) => {
+                    if let Err(e) = self.respond(&observations).await {
+                        tracing::error!(agent_id = %self.agent_id, error = ?e, "ComplianceAgent: respond failed");
                     }
                 }
             }
-            AgentMessage::Execute(action) => {
-                if let Err(e) = self.act(&action).await {
-                    tracing::error!(agent_id = %self.agent_id, error = ?e, "ComplianceAgent: act failed");
-                }
-            }
-            AgentMessage::Respond(observations) => {
-                if let Err(e) = self.respond(&observations).await {
-                    tracing::error!(agent_id = %self.agent_id, error = ?e, "ComplianceAgent: respond failed");
-                }
-            }
-        }
+        })
     }
 
 }
@@ -676,6 +678,7 @@ pub struct ComplianceAgentSnapshot {
     pub remediation_actions: Vec<RemediationAction>,
 }
 
+#[async_trait::async_trait]
 impl PersistentActor for ComplianceAgentActor {
     type Event    = ComplianceJournalEvent;
     type State    = ComplianceAgentState;

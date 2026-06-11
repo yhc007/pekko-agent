@@ -108,6 +108,7 @@ impl SagaManager {
 
 use async_trait::async_trait;
 use pekko_actor::{Actor, ActorContext};
+use std::pin::Pin;
 use pekko_persistence::{PersistentActor, PersistentContext};
 
 // ── Actor messages ────────────────────────────────────────────────────────────
@@ -122,21 +123,22 @@ pub enum SagaMessage {
 
 // ── pekko_actor::Actor ────────────────────────────────────────────────────────
 
-#[async_trait]
 impl Actor for SagaManager {
     type Message = SagaMessage;
 
-    async fn receive(&mut self, msg: Self::Message, _ctx: &mut ActorContext<Self>) {
-        match msg {
-            SagaMessage::Register(saga)         => { self.register_saga(saga); }
-            SagaMessage::StartExecution(id)     => { self.start_execution(&id); }
-            SagaMessage::CompleteStep { execution_id, step_index } => {
-                self.complete_step(&execution_id, step_index);
+    fn receive(&mut self, msg: Self::Message, _ctx: &mut ActorContext<Self>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            match msg {
+                SagaMessage::Register(saga)         => { self.register_saga(saga); }
+                SagaMessage::StartExecution(id)     => { self.start_execution(&id); }
+                SagaMessage::CompleteStep { execution_id, step_index } => {
+                    self.complete_step(&execution_id, step_index);
+                }
+                SagaMessage::FailStep { execution_id, step_index } => {
+                    self.fail_step(&execution_id, step_index);
+                }
             }
-            SagaMessage::FailStep { execution_id, step_index } => {
-                self.fail_step(&execution_id, step_index);
-            }
-        }
+        })
     }
 }
 

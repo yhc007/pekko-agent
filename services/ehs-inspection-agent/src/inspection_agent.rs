@@ -513,37 +513,39 @@ impl AgentActor for InspectionAgentActor {
 impl Actor for InspectionAgentActor {
     type Message = AgentMessage;
 
-    async fn receive(&mut self, msg: AgentMessage, _ctx: &mut ActorContext<Self>) {
-        match msg {
-            AgentMessage::Query(query) => {
-                match self.reason(&query).await {
-                    Ok(action) => {
-                        tracing::debug!(
-                            agent_id = %self.agent_id,
-                            "InspectionAgent: reason produced action"
-                        );
-                        if let Ok(observations) = self.act(&action).await {
-                            if !observations.is_empty() {
-                                let _ = self.respond(&observations).await;
+    fn receive(&mut self, msg: AgentMessage, _ctx: &mut ActorContext<Self>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            match msg {
+                AgentMessage::Query(query) => {
+                    match self.reason(&query).await {
+                        Ok(action) => {
+                            tracing::debug!(
+                                agent_id = %self.agent_id,
+                                "InspectionAgent: reason produced action"
+                            );
+                            if let Ok(observations) = self.act(&action).await {
+                                if !observations.is_empty() {
+                                    let _ = self.respond(&observations).await;
+                                }
                             }
                         }
+                        Err(e) => {
+                            tracing::error!(agent_id = %self.agent_id, error = ?e, "InspectionAgent: reason failed");
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!(agent_id = %self.agent_id, error = ?e, "InspectionAgent: reason failed");
+                }
+                AgentMessage::Execute(action) => {
+                    if let Err(e) = self.act(&action).await {
+                        tracing::error!(agent_id = %self.agent_id, error = ?e, "InspectionAgent: act failed");
+                    }
+                }
+                AgentMessage::Respond(observations) => {
+                    if let Err(e) = self.respond(&observations).await {
+                        tracing::error!(agent_id = %self.agent_id, error = ?e, "InspectionAgent: respond failed");
                     }
                 }
             }
-            AgentMessage::Execute(action) => {
-                if let Err(e) = self.act(&action).await {
-                    tracing::error!(agent_id = %self.agent_id, error = ?e, "InspectionAgent: act failed");
-                }
-            }
-            AgentMessage::Respond(observations) => {
-                if let Err(e) = self.respond(&observations).await {
-                    tracing::error!(agent_id = %self.agent_id, error = ?e, "InspectionAgent: respond failed");
-                }
-            }
-        }
+        })
     }
 
 }
@@ -589,6 +591,7 @@ pub struct InspectionAgentSnapshot {
     pub current_findings: Vec<Finding>,
 }
 
+#[async_trait::async_trait]
 impl PersistentActor for InspectionAgentActor {
     type Event    = InspectionJournalEvent;
     type State    = InspectionAgentState;

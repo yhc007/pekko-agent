@@ -9,7 +9,6 @@
 //! orch_ref.tell(OrchestratorMessage::RegisterAgent(info));
 //! ```
 
-use async_trait::async_trait;
 use pekko_agent_core::{AgentInfo, AgentStatus, AgentTask};
 use pekko_actor::{Actor, ActorContext};
 use crate::workflow::Workflow;
@@ -63,39 +62,44 @@ pub enum TaskExecutionStatus {
 
 // ─── pekko_actor::Actor impl ──────────────────────────────────────────────────
 
-#[async_trait]
 impl Actor for OrchestratorActor {
     type Message = OrchestratorMessage;
 
-    async fn pre_start(&mut self) {
-        info!("OrchestratorActor started inside ActorSystem");
+    fn pre_start(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            info!("OrchestratorActor started inside ActorSystem");
+        })
     }
 
-    async fn receive(&mut self, msg: Self::Message, _ctx: &mut ActorContext<Self>) {
-        match msg {
-            OrchestratorMessage::RegisterAgent(agent) => {
-                self.register_agent(agent);
+    fn receive(&mut self, msg: Self::Message, _ctx: &mut ActorContext<Self>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            match msg {
+                OrchestratorMessage::RegisterAgent(agent) => {
+                    self.register_agent(agent);
+                }
+                OrchestratorMessage::CreateWorkflow(wf) => {
+                    self.create_workflow(wf);
+                }
+                OrchestratorMessage::SubmitTask(task) => {
+                    self.submit_task(task);
+                }
+                OrchestratorMessage::AssignNextTask => {
+                    self.assign_next_task();
+                }
+                OrchestratorMessage::CompleteTask { task_id, result } => {
+                    self.complete_task(&task_id, result);
+                }
+                OrchestratorMessage::FailTask { task_id, error } => {
+                    self.fail_task(&task_id, error);
+                }
             }
-            OrchestratorMessage::CreateWorkflow(wf) => {
-                self.create_workflow(wf);
-            }
-            OrchestratorMessage::SubmitTask(task) => {
-                self.submit_task(task);
-            }
-            OrchestratorMessage::AssignNextTask => {
-                self.assign_next_task();
-            }
-            OrchestratorMessage::CompleteTask { task_id, result } => {
-                self.complete_task(&task_id, result);
-            }
-            OrchestratorMessage::FailTask { task_id, error } => {
-                self.fail_task(&task_id, error);
-            }
-        }
+        })
     }
 
-    async fn post_stop(&mut self) {
-        info!("OrchestratorActor stopped");
+    fn post_stop(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            info!("OrchestratorActor stopped");
+        })
     }
 }
 
