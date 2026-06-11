@@ -1,4 +1,5 @@
 pub mod conversation;
+pub mod pg_conversation;
 pub mod vector_store;
 pub mod episodic;
 
@@ -8,6 +9,7 @@ pub mod coredb_episodic;
 pub mod coredb_journal;
 
 pub use conversation::*;
+pub use pg_conversation::PgConversationStore;
 pub use vector_store::*;
 pub use episodic::*;
 

@@ -18,7 +18,7 @@ use tracing::{info, error, warn};
 use pekko_agent_core::{Message, TokenUsage, ShortTermMemory, ToolContext, AgentInfo, AgentStatus};
 use pekko_agent_llm::{LlmConfig, ClaudeClient, GeminiClient, OpenAIClient, LlmRequest, ClaudeMessage, ContentBlock, ClaudeTool};
 use pekko_agent_tools::{ToolRegistry, builtin::{PermitSearchTool, ComplianceCheckTool, EhsQueryTool}};
-use pekko_agent_memory::{InMemoryConversationStore, InMemoryVectorStore, InMemoryEpisodicStore};
+use pekko_agent_memory::{PgConversationStore, InMemoryVectorStore, InMemoryEpisodicStore};
 use pekko_agent_orchestrator::OrchestratorActor;
 use pekko_agent_events::EventPublisher;
 use pekko_agent_security::{RbacManager, TenantManager, AuditLogger};
@@ -28,7 +28,7 @@ use sqlx::PgPool;
 #[derive(Clone)]
 struct AppState {
     tool_registry: Arc<RwLock<ToolRegistry>>,
-    conversation_store: Arc<InMemoryConversationStore>,
+    conversation_store: Arc<PgConversationStore>,
     vector_store: Arc<InMemoryVectorStore>,
     episodic_store: Arc<InMemoryEpisodicStore>,
     orchestrator: Arc<RwLock<OrchestratorActor>>,
@@ -545,6 +545,11 @@ async fn main() -> anyhow::Result<()> {
     info!("Connected to PostgreSQL database");
     let pg_pool = Arc::new(pg_pool);
 
+    // Run conversation table migration
+    PgConversationStore::migrate(&pg_pool)
+        .await
+        .expect("Failed to run conversation store migration");
+
     // Initialize tool registry with built-in tools
     let mut tool_registry = ToolRegistry::new();
     tool_registry.register(Arc::new(PermitSearchTool));
@@ -603,7 +608,7 @@ async fn main() -> anyhow::Result<()> {
     // Create application state
     let state = AppState {
         tool_registry: Arc::new(RwLock::new(tool_registry)),
-        conversation_store: Arc::new(InMemoryConversationStore::new(100)),
+        conversation_store: Arc::new(PgConversationStore::new(pg_pool.clone(), 100)),
         vector_store: Arc::new(InMemoryVectorStore::new()),
         episodic_store: Arc::new(InMemoryEpisodicStore::new()),
         orchestrator,

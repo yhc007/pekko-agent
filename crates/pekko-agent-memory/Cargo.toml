@@ -18,3 +18,4 @@ tracing.workspace = true
 anyhow.workspace = true
 pekko-persistence.workspace = true
 coredb.workspace = true
+sqlx.workspace = true
