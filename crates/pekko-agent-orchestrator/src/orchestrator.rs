@@ -29,14 +29,14 @@ use uuid::Uuid;
 
 use pekko_actor::{Actor, ActorContext};
 use pekko_agent_core::{
-    AgentInfo, AgentProfile, AgentStatus, AgentTask, Message, MessageRole,
+    AgentInfo, AgentProfile, AgentStatus, AgentTask, LongTermMemory, Message, MessageRole,
     ShortTermMemory, ToolContext, ToolDefinition,
 };
 use pekko_agent_llm::{
     ClaudeClient, GeminiClient, LlmConfig, LlmRequest,
     ClaudeMessage, ContentBlock, ClaudeTool, OpenAIClient,
 };
-use pekko_agent_memory::PgConversationStore;
+use pekko_agent_memory::{PgConversationStore, PgVectorStore};
 use pekko_agent_tools::ToolRegistry;
 
 use crate::workflow::{build_step_content, topological_sort, Workflow, WorkflowResult, WorkflowStatus};
@@ -53,6 +53,8 @@ pub struct OrchestratorDeps {
     pub openai_client:      Option<Arc<OpenAIClient>>,
     pub llm_config:         LlmConfig,
     pub llm_provider:       String,
+    /// Optional long-term memory for RAG context injection.
+    pub vector_store:       Option<Arc<PgVectorStore>>,
 }
 
 // ─── Result type ─────────────────────────────────────────────────────────────
@@ -241,19 +243,20 @@ impl Actor for OrchestratorActor {
                 agent_id, content, session_id, tenant_id, user_id, reply_to,
             } => {
                 let profile = self.agent_profiles.get(&agent_id).cloned().unwrap_or_default();
-                let conv   = self.deps.conversation_store.clone();
-                let tools  = self.deps.tool_registry.clone();
-                let claude = self.deps.claude_client.clone();
-                let gemini = self.deps.gemini_client.clone();
-                let openai = self.deps.openai_client.clone();
-                let cfg    = self.deps.llm_config.clone();
-                let prov   = self.deps.llm_provider.clone();
+                let conv    = self.deps.conversation_store.clone();
+                let tools   = self.deps.tool_registry.clone();
+                let claude  = self.deps.claude_client.clone();
+                let gemini  = self.deps.gemini_client.clone();
+                let openai  = self.deps.openai_client.clone();
+                let cfg     = self.deps.llm_config.clone();
+                let prov    = self.deps.llm_provider.clone();
+                let vs      = self.deps.vector_store.clone();
 
                 tokio::spawn(async move {
                     let result = run_query_loop(
                         agent_id, content, session_id, tenant_id, user_id,
                         conv, tools, claude, gemini, openai, cfg, prov,
-                        profile,
+                        profile, vs,
                     ).await;
                     let _ = reply_to.send(result);
                 });
@@ -264,19 +267,20 @@ impl Actor for OrchestratorActor {
                 agent_id, content, session_id, tenant_id, user_id, event_tx,
             } => {
                 let profile = self.agent_profiles.get(&agent_id).cloned().unwrap_or_default();
-                let conv   = self.deps.conversation_store.clone();
-                let tools  = self.deps.tool_registry.clone();
-                let claude = self.deps.claude_client.clone();
-                let gemini = self.deps.gemini_client.clone();
-                let openai = self.deps.openai_client.clone();
-                let cfg    = self.deps.llm_config.clone();
-                let prov   = self.deps.llm_provider.clone();
+                let conv    = self.deps.conversation_store.clone();
+                let tools   = self.deps.tool_registry.clone();
+                let claude  = self.deps.claude_client.clone();
+                let gemini  = self.deps.gemini_client.clone();
+                let openai  = self.deps.openai_client.clone();
+                let cfg     = self.deps.llm_config.clone();
+                let prov    = self.deps.llm_provider.clone();
+                let vs      = self.deps.vector_store.clone();
 
                 tokio::spawn(async move {
                     run_stream_loop(
                         agent_id, content, session_id, tenant_id, user_id,
                         conv, tools, claude, gemini, openai, cfg, prov,
-                        event_tx, profile,
+                        event_tx, profile, vs,
                     ).await;
                 });
                 Box::pin(async {})
@@ -550,22 +554,26 @@ async fn call_llm(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_query_loop(
-    agent_id:   String,
-    content:    String,
-    session_id: Uuid,
-    tenant_id:  String,
-    user_id:    String,
-    conv:       Arc<PgConversationStore>,
-    tools:      Arc<RwLock<ToolRegistry>>,
-    claude:     Arc<ClaudeClient>,
-    gemini:     Option<Arc<GeminiClient>>,
-    openai:     Option<Arc<OpenAIClient>>,
-    cfg:        LlmConfig,
-    provider:   String,
-    profile:    AgentProfile,
+    agent_id:     String,
+    content:      String,
+    session_id:   Uuid,
+    tenant_id:    String,
+    user_id:      String,
+    conv:         Arc<PgConversationStore>,
+    tools:        Arc<RwLock<ToolRegistry>>,
+    claude:       Arc<ClaudeClient>,
+    gemini:       Option<Arc<GeminiClient>>,
+    openai:       Option<Arc<OpenAIClient>>,
+    cfg:          LlmConfig,
+    provider:     String,
+    profile:      AgentProfile,
+    vector_store: Option<Arc<PgVectorStore>>,
 ) -> Result<QueryResult, String> {
     // Persist user message
     let _ = conv.append_message(&session_id, Message::user(&content)).await;
+
+    // RAG: inject relevant long-term memory as context prefix
+    let rag_prefix = build_rag_prefix(&content, vector_store.as_deref()).await;
 
     // Build history
     let history: Vec<Message> = conv.get_conversation(&session_id).await.unwrap_or_default();
@@ -576,6 +584,31 @@ async fn run_query_loop(
         },
         content: vec![ContentBlock::Text { text: m.content.clone() }],
     }).collect();
+
+    // Prepend RAG context as the first user message when history is empty,
+    // or inject it as a standalone context block before the latest query.
+    if let Some(prefix) = rag_prefix {
+        if messages.is_empty() {
+            // history is just the current user message we just appended — replace it
+            // with [context, query] pair so the LLM sees the context first.
+            messages.push(ClaudeMessage {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text { text: prefix }],
+            });
+            messages.push(ClaudeMessage {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text { text: "관련 컨텍스트를 확인했습니다. 질문에 답변하겠습니다.".to_string() }],
+            });
+        } else if let Some(last) = messages.last_mut() {
+            // Append RAG context to the final user message
+            if last.role == "user" {
+                if let Some(ContentBlock::Text { text }) = last.content.last_mut() {
+                    text.push_str("\n\n");
+                    text.push_str(&prefix);
+                }
+            }
+        }
+    }
 
     let all_tool_defs = tools.read().await.list_tools();
     let tool_defs: Vec<ToolDefinition> = match &profile.tool_whitelist {
@@ -695,6 +728,31 @@ async fn run_query_loop(
     })
 }
 
+// ─── RAG helper ───────────────────────────────────────────────────────────────
+
+/// Search the vector store for relevant documents and format them as a context
+/// prefix that can be prepended to the user query.
+/// Returns `None` when the store is absent or returns no results.
+async fn build_rag_prefix(query: &str, vs: Option<&PgVectorStore>) -> Option<String> {
+    let store = vs?;
+    let results = store.search(query, 3).await.ok()?;
+    if results.is_empty() {
+        return None;
+    }
+
+    let mut prefix = String::from("[장기 기억 — 관련 참고 문서]\n");
+    for (i, r) in results.iter().enumerate() {
+        prefix.push_str(&format!(
+            "{}. [출처: {}] (유사도: {:.2})\n{}\n\n",
+            i + 1,
+            r.source,
+            r.score,
+            r.content,
+        ));
+    }
+    Some(prefix)
+}
+
 // ─── Streaming helpers ────────────────────────────────────────────────────────
 
 /// Send one JSON event into the bounded channel.
@@ -708,22 +766,25 @@ async fn emit_event(tx: &mpsc::Sender<String>, v: serde_json::Value) {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_stream_loop(
-    agent_id:   String,
-    content:    String,
-    session_id: Uuid,
-    tenant_id:  String,
-    user_id:    String,
-    conv:       Arc<PgConversationStore>,
-    tools:      Arc<RwLock<ToolRegistry>>,
-    claude:     Arc<ClaudeClient>,
-    gemini:     Option<Arc<GeminiClient>>,
-    openai:     Option<Arc<OpenAIClient>>,
-    cfg:        LlmConfig,
-    provider:   String,
-    tx:         mpsc::Sender<String>,
-    profile:    AgentProfile,
+    agent_id:     String,
+    content:      String,
+    session_id:   Uuid,
+    tenant_id:    String,
+    user_id:      String,
+    conv:         Arc<PgConversationStore>,
+    tools:        Arc<RwLock<ToolRegistry>>,
+    claude:       Arc<ClaudeClient>,
+    gemini:       Option<Arc<GeminiClient>>,
+    openai:       Option<Arc<OpenAIClient>>,
+    cfg:          LlmConfig,
+    provider:     String,
+    tx:           mpsc::Sender<String>,
+    profile:      AgentProfile,
+    vector_store: Option<Arc<PgVectorStore>>,
 ) {
     let _ = conv.append_message(&session_id, Message::user(&content)).await;
+
+    let rag_prefix = build_rag_prefix(&content, vector_store.as_deref()).await;
 
     let history: Vec<Message> = conv.get_conversation(&session_id).await.unwrap_or_default();
     let mut messages: Vec<ClaudeMessage> = history.iter().map(|m| ClaudeMessage {
@@ -733,6 +794,26 @@ async fn run_stream_loop(
         },
         content: vec![ContentBlock::Text { text: m.content.clone() }],
     }).collect();
+
+    if let Some(prefix) = rag_prefix {
+        if messages.is_empty() {
+            messages.push(ClaudeMessage {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text { text: prefix }],
+            });
+            messages.push(ClaudeMessage {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text { text: "관련 컨텍스트를 확인했습니다. 질문에 답변하겠습니다.".to_string() }],
+            });
+        } else if let Some(last) = messages.last_mut() {
+            if last.role == "user" {
+                if let Some(ContentBlock::Text { text }) = last.content.last_mut() {
+                    text.push_str("\n\n");
+                    text.push_str(&prefix);
+                }
+            }
+        }
+    }
 
     let all_tool_defs = tools.read().await.list_tools();
     let tool_defs: Vec<ToolDefinition> = match &profile.tool_whitelist {
@@ -929,7 +1010,7 @@ async fn run_workflow_engine(
                 "workflow".to_string(), "system".to_string(),
                 conv.clone(), tools.clone(),
                 claude.clone(), gemini.clone(), openai.clone(),
-                cfg.clone(), provider.clone(), profile,
+                cfg.clone(), provider.clone(), profile, None,
             ),
         ).await;
 

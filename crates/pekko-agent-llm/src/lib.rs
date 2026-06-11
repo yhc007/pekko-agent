@@ -4,6 +4,7 @@ pub mod openai_client;
 pub mod gateway;
 pub mod types;
 pub mod circuit_breaker;
+pub mod embedding;
 
 pub use client::*;
 pub use gemini_client::*;
@@ -11,3 +12,4 @@ pub use openai_client::*;
 pub use gateway::*;
 pub use types::*;
 pub use circuit_breaker::*;
+pub use embedding::EmbeddingClient;

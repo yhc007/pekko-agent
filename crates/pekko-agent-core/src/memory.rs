@@ -23,6 +23,13 @@ pub trait LongTermMemory: Send + Sync {
     async fn delete(&self, doc_id: &str) -> Result<(), MemoryError>;
 }
 
+/// Converts text into a dense vector embedding.
+#[async_trait]
+pub trait Embedder: Send + Sync {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, MemoryError>;
+    fn dims(&self) -> usize;
+}
+
 /// Episodic memory (Agent decision history)
 #[async_trait]
 pub trait EpisodicMemory: Send + Sync {

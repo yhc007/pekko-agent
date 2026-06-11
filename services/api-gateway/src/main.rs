@@ -24,7 +24,9 @@ use pekko_actor::ActorRef;
 use pekko_agent_core::{TokenUsage, ShortTermMemory, AgentInfo, AgentProfile, AgentStatus};
 use pekko_agent_llm::{LlmConfig, ClaudeClient, GeminiClient, OpenAIClient};
 use pekko_agent_tools::{ToolRegistry, builtin::{PermitSearchTool, ComplianceCheckTool, EhsQueryTool}};
-use pekko_agent_memory::PgConversationStore;
+use pekko_agent_memory::{PgConversationStore, PgVectorStore};
+use pekko_agent_core::{LongTermMemory, MemoryDocument};
+use pekko_agent_llm::EmbeddingClient;
 use pekko_agent_orchestrator::{
     OrchestratorActor, OrchestratorDeps, OrchestratorMessage,
     Workflow, WorkflowResult,
@@ -56,6 +58,7 @@ struct AppState {
     rbac:               Arc<RwLock<RbacManager>>,
     /// API-key → user identity map.  Keyed by the raw key string.
     api_keys:           Arc<HashMap<String, ApiKeyEntry>>,
+    vector_store:       Option<Arc<PgVectorStore>>,
 }
 
 // ── JWT extractor ─────────────────────────────────────────────────────────────
@@ -520,6 +523,98 @@ async fn list_tools(
     Ok(Json(registry.list_tools()))
 }
 
+// ── Long-term memory (vector store) endpoints ────────────────────────────────
+
+#[derive(Deserialize)]
+struct MemoryStoreRequest {
+    id:       Option<String>,
+    content:  String,
+    source:   String,
+    #[serde(default = "default_tenant")]
+    agent_id: String,
+    #[serde(default)]
+    metadata: std::collections::HashMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct MemoryStoreResponse { doc_id: String }
+
+#[derive(Deserialize)]
+struct MemorySearchRequest {
+    query: String,
+    #[serde(default = "default_top_k")]
+    top_k: usize,
+}
+fn default_top_k() -> usize { 5 }
+
+/// POST /api/memory/store  — requires admin.all
+async fn memory_store(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+    Json(req):    Json<MemoryStoreRequest>,
+) -> Result<Json<MemoryStoreResponse>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin.all").await?;
+
+    let vs = state.vector_store.as_ref()
+        .ok_or_else(|| make_error(StatusCode::SERVICE_UNAVAILABLE, "NO_VECTOR_STORE",
+            "Vector store not configured"))?;
+
+    let doc = MemoryDocument {
+        id:       req.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        content:  req.content,
+        source:   req.source,
+        agent_id: req.agent_id,
+        metadata: req.metadata,
+    };
+    let doc_id = vs.store(doc)
+        .await
+        .map_err(|e| internal_error(format!("Memory store error: {e}")))?;
+
+    Ok(Json(MemoryStoreResponse { doc_id }))
+}
+
+/// POST /api/memory/search  — requires agent.delegate
+async fn memory_search(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+    Json(req):    Json<MemorySearchRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "agent.delegate").await?;
+
+    let vs = state.vector_store.as_ref()
+        .ok_or_else(|| make_error(StatusCode::SERVICE_UNAVAILABLE, "NO_VECTOR_STORE",
+            "Vector store not configured"))?;
+
+    let results = vs.search(&req.query, req.top_k)
+        .await
+        .map_err(|e| internal_error(format!("Memory search error: {e}")))?;
+
+    Ok(Json(results))
+}
+
+/// DELETE /api/memory/:doc_id  — requires admin.all
+async fn memory_delete(
+    auth:           AuthUser,
+    Path(doc_id):   Path<String>,
+    State(state):   State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin.all").await?;
+
+    let vs = state.vector_store.as_ref()
+        .ok_or_else(|| make_error(StatusCode::SERVICE_UNAVAILABLE, "NO_VECTOR_STORE",
+            "Vector store not configured"))?;
+
+    vs.delete(&doc_id)
+        .await
+        .map_err(|e| match e {
+            pekko_agent_core::MemoryError::NotFound(m) =>
+                make_error(StatusCode::NOT_FOUND, "NOT_FOUND", m),
+            other => internal_error(other.to_string()),
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── Workflow endpoints ────────────────────────────────────────────────────────
 
 /// POST /api/workflows  — execute a workflow synchronously; requires agent.delegate
@@ -743,6 +838,33 @@ async fn main() -> anyhow::Result<()> {
     let tool_registry = Arc::new(RwLock::new(tool_registry));
     info!(tools = tool_registry.read().await.list_tools().len(), "Tool registry ready");
 
+    // ── Vector store (long-term memory / RAG) ────────────────────────────────
+    let embedder = std::env::var("OPENAI_API_KEY").ok().map(|key| {
+        let model = std::env::var("EMBEDDING_MODEL").ok();
+        Arc::new(EmbeddingClient::new(key, model)) as Arc<dyn pekko_agent_core::Embedder>
+    });
+
+    let vector_store: Option<Arc<PgVectorStore>> = if std::env::var("DISABLE_VECTOR_STORE")
+        .map(|v| v == "true").unwrap_or(false)
+    {
+        info!("Vector store disabled by DISABLE_VECTOR_STORE=true");
+        None
+    } else {
+        match PgVectorStore::migrate(&pg_pool).await {
+            Ok(()) => {
+                let has_embedder = embedder.is_some();
+                let vs = Arc::new(PgVectorStore::new(pg_pool.clone(), embedder));
+                info!(has_embedder, "PgVectorStore ready");
+                Some(vs)
+            }
+            Err(e) => {
+                warn!(error = %e, "pgvector migration failed — vector store disabled. \
+                    Install the pgvector extension to enable RAG.");
+                None
+            }
+        }
+    };
+
     // ── ActorSystem + OrchestratorActor ───────────────────────────────────────
     let actor_system = pekko_actor::ActorSystem::new("pekko-agent");
 
@@ -754,6 +876,7 @@ async fn main() -> anyhow::Result<()> {
         openai_client,
         llm_config,
         llm_provider,
+        vector_store:       vector_store.clone(),
     };
 
     let orchestrator_ref = actor_system
@@ -805,6 +928,7 @@ async fn main() -> anyhow::Result<()> {
         jwt_manager,
         rbac,
         api_keys,
+        vector_store,
     };
 
     // ── Router ────────────────────────────────────────────────────────────────
@@ -827,6 +951,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/tools",                         get(list_tools))
         .route("/api/workflows",                     post(execute_workflow))
         .route("/api/workflows/:workflow_id",        get(get_workflow_status))
+        .route("/api/memory/store",                  post(memory_store))
+        .route("/api/memory/search",                 post(memory_search))
+        .route("/api/memory/:doc_id",                axum::routing::delete(memory_delete))
         .layer(TimeoutLayer::new(BLOCKING_TIMEOUT));
 
     let streaming_protected = Router::new()
