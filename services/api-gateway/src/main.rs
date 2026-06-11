@@ -2,7 +2,8 @@ use axum::{
     async_trait,
     extract::{FromRequestParts, Path, State, Json},
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    http::{request::Parts, StatusCode, header},
+    http::{request::Parts, StatusCode, header, Request},
+    middleware::{self, Next},
     routing::{get, post},
     Router,
     response::{IntoResponse, sse::{Event, KeepAlive, Sse}},
@@ -27,6 +28,7 @@ use pekko_agent_tools::{ToolRegistry, builtin::{PermitSearchTool, ComplianceChec
 use pekko_agent_memory::{PgConversationStore, PgVectorStore};
 use pekko_agent_core::{LongTermMemory, MemoryDocument};
 use pekko_agent_llm::EmbeddingClient;
+use pekko_agent_observability::{MetricsRegistry, TracerProvider};
 use pekko_agent_orchestrator::{
     OrchestratorActor, OrchestratorDeps, OrchestratorMessage,
     Workflow, WorkflowResult,
@@ -59,6 +61,7 @@ struct AppState {
     /// API-key → user identity map.  Keyed by the raw key string.
     api_keys:           Arc<HashMap<String, ApiKeyEntry>>,
     vector_store:       Option<Arc<PgVectorStore>>,
+    metrics:            Arc<MetricsRegistry>,
 }
 
 // ── JWT extractor ─────────────────────────────────────────────────────────────
@@ -221,6 +224,74 @@ fn forbidden(msg: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
+
+// ── HTTP metrics middleware ────────────────────────────────────────────────────
+
+/// Classify a full path into a stable label (avoids high-cardinality IDs).
+fn path_label(path: &str) -> &'static str {
+    if path.starts_with("/api/agents/") && path.ends_with("/query/stream") {
+        "/api/agents/:id/query/stream"
+    } else if path.starts_with("/api/agents/") && path.ends_with("/query") {
+        "/api/agents/:id/query"
+    } else if path.starts_with("/api/agents/") && path.ends_with("/ws") {
+        "/api/agents/:id/ws"
+    } else if path.starts_with("/api/sessions/") {
+        "/api/sessions/:id/history"
+    } else if path.starts_with("/api/workflows/") && path != "/api/workflows/stream" {
+        "/api/workflows/:id"
+    } else if path.starts_with("/api/memory/") && !path.ends_with("/store") && !path.ends_with("/search") {
+        "/api/memory/:id"
+    } else {
+        match path {
+            "/api/health"             => "/api/health",
+            "/api/auth/token"         => "/api/auth/token",
+            "/api/agents"             => "/api/agents",
+            "/api/agents/register"    => "/api/agents/register",
+            "/api/tools"              => "/api/tools",
+            "/api/workflows"          => "/api/workflows",
+            "/api/workflows/stream"   => "/api/workflows/stream",
+            "/api/memory/store"       => "/api/memory/store",
+            "/api/memory/search"      => "/api/memory/search",
+            "/metrics"                => "/metrics",
+            _                         => "other",
+        }
+    }
+}
+
+async fn http_metrics_middleware(
+    State(state): State<AppState>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> impl IntoResponse {
+    let method = req.method().to_string();
+    let path   = path_label(req.uri().path());
+    let start  = std::time::Instant::now();
+
+    let resp = next.run(req).await;
+
+    let status = resp.status().as_u16().to_string();
+    let elapsed = start.elapsed().as_secs_f64();
+
+    state.metrics.http_requests_total
+        .with_label_values(&[&method, path, &status])
+        .inc();
+    state.metrics.http_duration_secs
+        .with_label_values(&[&method, path])
+        .observe(elapsed);
+
+    resp
+}
+
+/// GET /metrics  — Prometheus scrape endpoint (public, no auth)
+async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    match state.metrics.render() {
+        Ok(body) => (
+            [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+            body,
+        ).into_response(),
+        Err(e) => internal_error(format!("Metrics render error: {e}")).into_response(),
+    }
+}
 
 /// GET /api/health  — public, no auth required
 async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
@@ -440,6 +511,7 @@ async fn ws_agent_handler(
     claims:      Claims,
 ) {
     info!(agent_id = %agent_id, user = %claims.sub, "WebSocket connection opened");
+    state.metrics.active_ws_connections.inc();
 
     loop {
         let msg = match socket.recv().await {
@@ -494,6 +566,7 @@ async fn ws_agent_handler(
         }
     }
 
+    state.metrics.active_ws_connections.dec();
     info!(agent_id = %agent_id, user = %claims.sub, "WebSocket connection closed");
 }
 
@@ -750,12 +823,17 @@ async fn register_agent(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
-        .json()
-        .init();
+
+    // Tracing: JSON logs + optional OTLP export (set OTLP_ENDPOINT to enable)
+    let _otel_provider: Option<TracerProvider> =
+        pekko_agent_observability::tracing::init("api-gateway");
 
     info!("Starting pekko-agent API Gateway");
+
+    // Prometheus metrics
+    let metrics = MetricsRegistry::new()
+        .expect("Failed to create MetricsRegistry");
+    info!("Prometheus metrics registry initialised");
 
     // ── JWT + Auth ────────────────────────────────────────────────────────────
     let jwt_secret = std::env::var("JWT_SECRET")
@@ -877,6 +955,7 @@ async fn main() -> anyhow::Result<()> {
         llm_config,
         llm_provider,
         vector_store:       vector_store.clone(),
+        metrics:            Some(metrics.clone()),
     };
 
     let orchestrator_ref = actor_system
@@ -929,6 +1008,7 @@ async fn main() -> anyhow::Result<()> {
         rbac,
         api_keys,
         vector_store,
+        metrics,
     };
 
     // ── Router ────────────────────────────────────────────────────────────────
@@ -941,7 +1021,8 @@ async fn main() -> anyhow::Result<()> {
     //
     let public_routes = Router::new()
         .route("/api/health",      get(health_check))
-        .route("/api/auth/token",  post(issue_token));
+        .route("/api/auth/token",  post(issue_token))
+        .route("/metrics",         get(prometheus_metrics)); // Prometheus scrape
 
     let blocking_protected = Router::new()
         .route("/api/agents",                        get(list_agents))
@@ -968,6 +1049,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(public_routes)
         .merge(blocking_protected)
         .merge(streaming_protected)
+        .layer(middleware::from_fn_with_state(state.clone(), http_metrics_middleware))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -986,4 +1068,5 @@ async fn main() -> anyhow::Result<()> {
 async fn shutdown_signal() {
     tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl+c");
     info!("Graceful shutdown");
+    // OTel flush is handled by _otel_provider drop at end of main()
 }

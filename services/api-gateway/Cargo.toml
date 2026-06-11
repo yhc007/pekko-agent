@@ -13,6 +13,7 @@ pekko-agent-memory = { path = "../../crates/pekko-agent-memory" }
 pekko-agent-orchestrator = { path = "../../crates/pekko-agent-orchestrator" }
 pekko-agent-events = { path = "../../crates/pekko-agent-events" }
 pekko-agent-security = { path = "../../crates/pekko-agent-security" }
+pekko-agent-observability = { path = "../../crates/pekko-agent-observability" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

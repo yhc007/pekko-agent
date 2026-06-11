@@ -37,6 +37,7 @@ use pekko_agent_llm::{
     ClaudeMessage, ContentBlock, ClaudeTool, OpenAIClient,
 };
 use pekko_agent_memory::{PgConversationStore, PgVectorStore};
+use pekko_agent_observability::MetricsRegistry;
 use pekko_agent_tools::ToolRegistry;
 
 use crate::workflow::{build_step_content, topological_sort, Workflow, WorkflowResult, WorkflowStatus};
@@ -55,6 +56,8 @@ pub struct OrchestratorDeps {
     pub llm_provider:       String,
     /// Optional long-term memory for RAG context injection.
     pub vector_store:       Option<Arc<PgVectorStore>>,
+    /// Optional Prometheus metrics registry.
+    pub metrics:            Option<Arc<MetricsRegistry>>,
 }
 
 // ─── Result type ─────────────────────────────────────────────────────────────
@@ -242,21 +245,22 @@ impl Actor for OrchestratorActor {
             OrchestratorMessage::QueryAgent {
                 agent_id, content, session_id, tenant_id, user_id, reply_to,
             } => {
-                let profile = self.agent_profiles.get(&agent_id).cloned().unwrap_or_default();
-                let conv    = self.deps.conversation_store.clone();
-                let tools   = self.deps.tool_registry.clone();
-                let claude  = self.deps.claude_client.clone();
-                let gemini  = self.deps.gemini_client.clone();
-                let openai  = self.deps.openai_client.clone();
-                let cfg     = self.deps.llm_config.clone();
-                let prov    = self.deps.llm_provider.clone();
-                let vs      = self.deps.vector_store.clone();
+                let profile  = self.agent_profiles.get(&agent_id).cloned().unwrap_or_default();
+                let conv     = self.deps.conversation_store.clone();
+                let tools    = self.deps.tool_registry.clone();
+                let claude   = self.deps.claude_client.clone();
+                let gemini   = self.deps.gemini_client.clone();
+                let openai   = self.deps.openai_client.clone();
+                let cfg      = self.deps.llm_config.clone();
+                let prov     = self.deps.llm_provider.clone();
+                let vs       = self.deps.vector_store.clone();
+                let metrics  = self.deps.metrics.clone();
 
                 tokio::spawn(async move {
                     let result = run_query_loop(
                         agent_id, content, session_id, tenant_id, user_id,
                         conv, tools, claude, gemini, openai, cfg, prov,
-                        profile, vs,
+                        profile, vs, metrics,
                     ).await;
                     let _ = reply_to.send(result);
                 });
@@ -266,21 +270,22 @@ impl Actor for OrchestratorActor {
             OrchestratorMessage::StreamAgent {
                 agent_id, content, session_id, tenant_id, user_id, event_tx,
             } => {
-                let profile = self.agent_profiles.get(&agent_id).cloned().unwrap_or_default();
-                let conv    = self.deps.conversation_store.clone();
-                let tools   = self.deps.tool_registry.clone();
-                let claude  = self.deps.claude_client.clone();
-                let gemini  = self.deps.gemini_client.clone();
-                let openai  = self.deps.openai_client.clone();
-                let cfg     = self.deps.llm_config.clone();
-                let prov    = self.deps.llm_provider.clone();
-                let vs      = self.deps.vector_store.clone();
+                let profile  = self.agent_profiles.get(&agent_id).cloned().unwrap_or_default();
+                let conv     = self.deps.conversation_store.clone();
+                let tools    = self.deps.tool_registry.clone();
+                let claude   = self.deps.claude_client.clone();
+                let gemini   = self.deps.gemini_client.clone();
+                let openai   = self.deps.openai_client.clone();
+                let cfg      = self.deps.llm_config.clone();
+                let prov     = self.deps.llm_provider.clone();
+                let vs       = self.deps.vector_store.clone();
+                let metrics  = self.deps.metrics.clone();
 
                 tokio::spawn(async move {
                     run_stream_loop(
                         agent_id, content, session_id, tenant_id, user_id,
                         conv, tools, claude, gemini, openai, cfg, prov,
-                        event_tx, profile, vs,
+                        event_tx, profile, vs, metrics,
                     ).await;
                 });
                 Box::pin(async {})
@@ -568,7 +573,9 @@ async fn run_query_loop(
     provider:     String,
     profile:      AgentProfile,
     vector_store: Option<Arc<PgVectorStore>>,
+    metrics:      Option<Arc<MetricsRegistry>>,
 ) -> Result<QueryResult, String> {
+    let _query_start = std::time::Instant::now();
     // Persist user message
     let _ = conv.append_message(&session_id, Message::user(&content)).await;
 
@@ -624,6 +631,13 @@ async fn run_query_loop(
     let mut total_output: u32 = 0;
     let mut final_text = String::new();
 
+    // Record agent query metric
+    if let Some(m) = &metrics {
+        m.agent_queries_total
+            .with_label_values(&[&agent_id, &tenant_id])
+            .inc();
+    }
+
     for _round in 0..MAX_TOOL_ROUNDS {
         let req = LlmRequest {
             system_prompt: system_prompt.clone(),
@@ -634,12 +648,42 @@ async fn run_query_loop(
             cacheable: false,
         };
 
+        let llm_start = std::time::Instant::now();
         let resp = call_llm(
             &provider, &req,
             &claude,
             gemini.as_deref(),
             openai.as_deref(),
-        ).await?;
+        ).await;
+        let llm_elapsed = llm_start.elapsed().as_secs_f64();
+
+        let resp = match resp {
+            Ok(r) => {
+                if let Some(m) = &metrics {
+                    m.llm_requests_total
+                        .with_label_values(&[&provider, &agent_id, "ok"])
+                        .inc();
+                    m.llm_request_duration_secs
+                        .with_label_values(&[&provider, &agent_id])
+                        .observe(llm_elapsed);
+                    m.llm_input_tokens_total
+                        .with_label_values(&[&provider])
+                        .inc_by(r.usage.input_tokens as f64);
+                    m.llm_output_tokens_total
+                        .with_label_values(&[&provider])
+                        .inc_by(r.usage.output_tokens as f64);
+                }
+                r
+            }
+            Err(e) => {
+                if let Some(m) = &metrics {
+                    m.llm_requests_total
+                        .with_label_values(&[&provider, &agent_id, "error"])
+                        .inc();
+                }
+                return Err(e);
+            }
+        };
 
         total_input  += resp.usage.input_tokens;
         total_output += resp.usage.output_tokens;
@@ -677,13 +721,24 @@ async fn run_query_loop(
                 info!(tool_name = %tool_name, "Executing tool");
                 all_tools_used.push(tool_name.clone());
 
+                let tool_start = std::time::Instant::now();
                 let result = {
                     let mut reg = tools.write().await;
                     reg.execute(tool_name, tool_input.clone(), &ctx).await
                 };
+                let tool_elapsed = tool_start.elapsed().as_secs_f64();
 
                 let (content_str, is_error) = match result {
                     Ok(out) => {
+                        let ok = !out.is_error;
+                        if let Some(m) = &metrics {
+                            m.tool_executions_total
+                                .with_label_values(&[tool_name, if ok { "ok" } else { "error" }])
+                                .inc();
+                            m.tool_duration_secs
+                                .with_label_values(&[tool_name])
+                                .observe(tool_elapsed);
+                        }
                         let s = truncate_tool_result(
                             &serde_json::to_string(&out.content).unwrap_or_default()
                         );
@@ -691,6 +746,11 @@ async fn run_query_loop(
                     }
                     Err(e) => {
                         warn!(tool = %tool_name, error = %e, "Tool failed");
+                        if let Some(m) = &metrics {
+                            m.tool_executions_total
+                                .with_label_values(&[tool_name, "error"])
+                                .inc();
+                        }
                         (format!("{{\"error\":\"{e}\"}}"), Some(true))
                     }
                 };
@@ -781,6 +841,7 @@ async fn run_stream_loop(
     tx:           mpsc::Sender<String>,
     profile:      AgentProfile,
     vector_store: Option<Arc<PgVectorStore>>,
+    metrics:      Option<Arc<MetricsRegistry>>,
 ) {
     let _ = conv.append_message(&session_id, Message::user(&content)).await;
 
@@ -829,6 +890,12 @@ async fn run_stream_loop(
     let mut total_output: u32 = 0;
     let mut final_text = String::new();
 
+    if let Some(m) = &metrics {
+        m.agent_queries_total
+            .with_label_values(&[&agent_id, &tenant_id])
+            .inc();
+    }
+
     'outer: for round in 0..MAX_TOOL_ROUNDS {
         emit_event(&tx, serde_json::json!({"type": "thinking", "round": round})).await;
 
@@ -841,14 +908,40 @@ async fn run_stream_loop(
             cacheable: false,
         };
 
+        let llm_start = std::time::Instant::now();
         let resp = match call_llm(
             &provider, &req,
             &claude,
             gemini.as_deref(),
             openai.as_deref(),
         ).await {
-            Ok(r)  => r,
-            Err(e) => { emit_event(&tx, serde_json::json!({"type":"error","message": e})).await; break 'outer; }
+            Ok(r) => {
+                let elapsed = llm_start.elapsed().as_secs_f64();
+                if let Some(m) = &metrics {
+                    m.llm_requests_total
+                        .with_label_values(&[&provider, &agent_id, "ok"])
+                        .inc();
+                    m.llm_request_duration_secs
+                        .with_label_values(&[&provider, &agent_id])
+                        .observe(elapsed);
+                    m.llm_input_tokens_total
+                        .with_label_values(&[&provider])
+                        .inc_by(r.usage.input_tokens as f64);
+                    m.llm_output_tokens_total
+                        .with_label_values(&[&provider])
+                        .inc_by(r.usage.output_tokens as f64);
+                }
+                r
+            }
+            Err(e) => {
+                if let Some(m) = &metrics {
+                    m.llm_requests_total
+                        .with_label_values(&[&provider, &agent_id, "error"])
+                        .inc();
+                }
+                emit_event(&tx, serde_json::json!({"type":"error","message": e})).await;
+                break 'outer;
+            }
         };
 
         total_input  += resp.usage.input_tokens;
@@ -887,21 +980,36 @@ async fn run_stream_loop(
                 emit_event(&tx, serde_json::json!({"type": "tool_use", "tool": tool_name, "round": round})).await;
                 all_tools_used.push(tool_name.clone());
 
+                let tool_start = std::time::Instant::now();
                 let result = {
                     let mut reg = tools.write().await;
                     reg.execute(tool_name, tool_input.clone(), &ctx).await
                 };
+                let tool_elapsed = tool_start.elapsed().as_secs_f64();
 
                 let (content_str, is_error, ok) = match result {
                     Ok(out) => {
+                        let ok = !out.is_error;
+                        if let Some(m) = &metrics {
+                            m.tool_executions_total
+                                .with_label_values(&[tool_name, if ok { "ok" } else { "error" }])
+                                .inc();
+                            m.tool_duration_secs
+                                .with_label_values(&[tool_name])
+                                .observe(tool_elapsed);
+                        }
                         let s = truncate_tool_result(
                             &serde_json::to_string(&out.content).unwrap_or_default()
                         );
-                        let ok = !out.is_error;
                         (s, if out.is_error { Some(true) } else { None }, ok)
                     }
                     Err(e) => {
                         warn!(tool = %tool_name, error = %e, "Tool failed in stream");
+                        if let Some(m) = &metrics {
+                            m.tool_executions_total
+                                .with_label_values(&[tool_name, "error"])
+                                .inc();
+                        }
                         (format!("{{\"error\":\"{e}\"}}"), Some(true), false)
                     }
                 };
@@ -1010,7 +1118,7 @@ async fn run_workflow_engine(
                 "workflow".to_string(), "system".to_string(),
                 conv.clone(), tools.clone(),
                 claude.clone(), gemini.clone(), openai.clone(),
-                cfg.clone(), provider.clone(), profile, None,
+                cfg.clone(), provider.clone(), profile, None, None,
             ),
         ).await;
 

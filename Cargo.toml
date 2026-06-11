@@ -12,6 +12,7 @@ members = [
     "services/ehs-permit-agent",
     "services/ehs-inspection-agent",
     "services/ehs-compliance-agent",
+    "crates/pekko-agent-observability",
 ]
 exclude = [
     "frontend/web-chat",
@@ -64,7 +65,10 @@ rustls = "0.23"
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-opentelemetry = "0.24"
+opentelemetry       = { version = "0.24", features = ["trace"] }
+opentelemetry_sdk   = { version = "0.24", features = ["trace", "rt-tokio"] }
+opentelemetry-otlp  = { version = "0.17", features = ["trace", "tonic"] }
+tracing-opentelemetry = "0.25"
 prometheus = "0.13"
 
 # Utilities

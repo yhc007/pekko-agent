@@ -22,5 +22,6 @@ pekko-persistence.workspace = true
 pekko-agent-llm   = { path = "../pekko-agent-llm" }
 pekko-agent-tools = { path = "../pekko-agent-tools" }
 pekko-agent-memory = { path = "../pekko-agent-memory" }
+pekko-agent-observability = { path = "../pekko-agent-observability" }
 sqlx.workspace = true
 futures.workspace = true
