@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Workflow {
@@ -82,6 +82,91 @@ impl Workflow {
             _ => false,
         }
     }
+}
+
+// ─── Execution result ─────────────────────────────────────────────────────────
+
+/// Returned by `ExecuteWorkflow` and `StreamWorkflow` when the run finishes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkflowResult {
+    pub workflow_id:     Uuid,
+    pub name:            String,
+    pub status:          WorkflowStatus,
+    /// Accumulated outputs from every step (keyed by `output_key`).
+    pub context:         HashMap<String, serde_json::Value>,
+    pub completed_steps: Vec<String>,
+    pub failed_step:     Option<String>,
+    pub error:           Option<String>,
+}
+
+// ─── Topological sort (Kahn's algorithm) ─────────────────────────────────────
+
+/// Returns step indices in dependency order.
+/// Errors on unknown dependency references or cycles.
+pub fn topological_sort(steps: &[WorkflowStep]) -> Result<Vec<usize>, String> {
+    let n = steps.len();
+    let id_to_idx: HashMap<&str, usize> = steps.iter()
+        .enumerate().map(|(i, s)| (s.step_id.as_str(), i)).collect();
+
+    let mut in_degree = vec![0usize; n];
+    let mut adj: Vec<Vec<usize>> = vec![vec![]; n];
+
+    for (i, step) in steps.iter().enumerate() {
+        for dep in &step.depends_on {
+            let j = id_to_idx.get(dep.as_str())
+                .copied()
+                .ok_or_else(|| format!("Step '{}' depends on unknown step '{dep}'", step.step_id))?;
+            adj[j].push(i);
+            in_degree[i] += 1;
+        }
+    }
+
+    let mut queue: VecDeque<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+    let mut order = Vec::with_capacity(n);
+
+    while let Some(u) = queue.pop_front() {
+        order.push(u);
+        for &v in &adj[u] {
+            in_degree[v] -= 1;
+            if in_degree[v] == 0 { queue.push_back(v); }
+        }
+    }
+
+    if order.len() == n {
+        Ok(order)
+    } else {
+        Err("Workflow dependency graph has a cycle".to_string())
+    }
+}
+
+// ─── Step content builder ─────────────────────────────────────────────────────
+
+/// Build the LLM query string for a step.
+///
+/// The step's `action` becomes the base query.
+/// Inputs resolved from `context` via `input_mapping` are appended as
+/// structured context so the LLM can reference them without hallucination.
+pub fn build_step_content(
+    step:    &WorkflowStep,
+    context: &HashMap<String, serde_json::Value>,
+) -> String {
+    let mut content = step.action.clone();
+
+    let resolved: serde_json::Map<String, serde_json::Value> = step.input_mapping
+        .iter()
+        .filter_map(|(param, ctx_key)| {
+            context.get(ctx_key).map(|v| (param.clone(), v.clone()))
+        })
+        .collect();
+
+    if !resolved.is_empty() {
+        content.push_str("\n\n[이전 단계 컨텍스트]\n");
+        content.push_str(
+            &serde_json::to_string_pretty(&resolved).unwrap_or_default()
+        );
+    }
+
+    content
 }
 
 // ─── pekko_actor FSM-backed executor ─────────────────────────────────────────

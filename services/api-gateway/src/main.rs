@@ -25,7 +25,10 @@ use pekko_agent_core::{TokenUsage, ShortTermMemory, AgentInfo, AgentProfile, Age
 use pekko_agent_llm::{LlmConfig, ClaudeClient, GeminiClient, OpenAIClient};
 use pekko_agent_tools::{ToolRegistry, builtin::{PermitSearchTool, ComplianceCheckTool, EhsQueryTool}};
 use pekko_agent_memory::PgConversationStore;
-use pekko_agent_orchestrator::{OrchestratorActor, OrchestratorDeps, OrchestratorMessage};
+use pekko_agent_orchestrator::{
+    OrchestratorActor, OrchestratorDeps, OrchestratorMessage,
+    Workflow, WorkflowResult,
+};
 use pekko_agent_events::EventPublisher;
 use pekko_agent_security::{AuditLogger, AuditEntry, AuditOutcome, Claims, JwtError, JwtManager, RbacManager};
 use sqlx::PgPool;
@@ -517,6 +520,102 @@ async fn list_tools(
     Ok(Json(registry.list_tools()))
 }
 
+// ── Workflow endpoints ────────────────────────────────────────────────────────
+
+/// POST /api/workflows  — execute a workflow synchronously; requires agent.delegate
+async fn execute_workflow(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+    Json(workflow): Json<Workflow>,
+) -> Result<Json<WorkflowResult>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "agent.delegate").await?;
+
+    info!(
+        workflow_id = %workflow.id,
+        name = %workflow.name,
+        steps = workflow.steps.len(),
+        user = %auth.0.sub,
+        "ExecuteWorkflow → OrchestratorActor"
+    );
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    state.orchestrator_ref
+        .tell(OrchestratorMessage::ExecuteWorkflow {
+            workflow,
+            reply_to: reply_tx,
+        })
+        .map_err(|_| service_unavailable("Orchestrator actor unavailable"))?;
+
+    let result = reply_rx.await
+        .map_err(|_| internal_error("Orchestrator did not reply"))?
+        .map_err(|e| internal_error(format!("Workflow failed: {e}")))?;
+
+    Ok(Json(result))
+}
+
+/// POST /api/workflows/stream  — stream workflow execution events via SSE
+async fn stream_workflow(
+    auth:           AuthUser,
+    State(state):   State<AppState>,
+    Json(workflow): Json<Workflow>,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "agent.delegate").await?;
+
+    info!(
+        workflow_id = %workflow.id,
+        name = %workflow.name,
+        user = %auth.0.sub,
+        "StreamWorkflow → OrchestratorActor"
+    );
+
+    let (event_tx, event_rx) = mpsc::channel::<String>(256);
+
+    let result = state.orchestrator_ref.tell(OrchestratorMessage::StreamWorkflow {
+        workflow,
+        event_tx: event_tx.clone(),
+    });
+
+    if result.is_err() {
+        let _ = event_tx.try_send(
+            serde_json::json!({"type":"error","message":"Orchestrator actor unavailable"}).to_string()
+        );
+    }
+
+    let stream = stream::unfold(event_rx, |mut rx| async move {
+        rx.recv().await.map(|data| {
+            (Ok::<Event, Infallible>(Event::default().data(data)), rx)
+        })
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// GET /api/workflows/:workflow_id  — get current workflow status
+async fn get_workflow_status(
+    auth:               AuthUser,
+    Path(workflow_id):  Path<Uuid>,
+    State(state):       State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "memory.read").await?;
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    state.orchestrator_ref
+        .tell(OrchestratorMessage::GetWorkflowStatus {
+            workflow_id,
+            reply_to: reply_tx,
+        })
+        .map_err(|_| service_unavailable("Orchestrator actor unavailable"))?;
+
+    let status = reply_rx.await
+        .map_err(|_| internal_error("Orchestrator did not reply"))?;
+
+    match status {
+        Some(s) => Ok(Json(s).into_response()),
+        None => Err(make_error(StatusCode::NOT_FOUND, "NOT_FOUND",
+            format!("Workflow {workflow_id} not found"))),
+    }
+}
+
 // ── Agent registration endpoint ───────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -726,11 +825,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/agents/:agent_id/query",        post(query_agent))
         .route("/api/sessions/:session_id/history",  get(get_session_history))
         .route("/api/tools",                         get(list_tools))
+        .route("/api/workflows",                     post(execute_workflow))
+        .route("/api/workflows/:workflow_id",        get(get_workflow_status))
         .layer(TimeoutLayer::new(BLOCKING_TIMEOUT));
 
     let streaming_protected = Router::new()
         .route("/api/agents/:agent_id/query/stream", post(stream_query_agent))
-        .route("/api/agents/:agent_id/ws",           get(ws_agent));
+        .route("/api/agents/:agent_id/ws",           get(ws_agent))
+        .route("/api/workflows/stream",              post(stream_workflow));
 
     let port: u16 = std::env::var("API_GATEWAY_PORT")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(8080);

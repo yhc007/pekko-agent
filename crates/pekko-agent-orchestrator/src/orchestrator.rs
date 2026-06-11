@@ -39,7 +39,7 @@ use pekko_agent_llm::{
 use pekko_agent_memory::PgConversationStore;
 use pekko_agent_tools::ToolRegistry;
 
-use crate::workflow::Workflow;
+use crate::workflow::{build_step_content, topological_sort, Workflow, WorkflowResult, WorkflowStatus};
 use crate::saga::SagaManager;
 
 // ─── Service dependencies ────────────────────────────────────────────────────
@@ -110,6 +110,26 @@ pub enum OrchestratorMessage {
     GetAgents {
         reply_to: oneshot::Sender<Vec<AgentInfo>>,
     },
+
+    // ── Workflow execution ──
+
+    /// Create + execute a workflow; result returned through oneshot when done.
+    ExecuteWorkflow {
+        workflow: Workflow,
+        reply_to: oneshot::Sender<Result<WorkflowResult, String>>,
+    },
+
+    /// Create + execute a workflow with SSE-style event streaming.
+    StreamWorkflow {
+        workflow: Workflow,
+        event_tx: mpsc::Sender<String>,
+    },
+
+    /// Return the current `WorkflowStatus` for a previously-started workflow.
+    GetWorkflowStatus {
+        workflow_id: Uuid,
+        reply_to:    oneshot::Sender<Option<WorkflowStatus>>,
+    },
 }
 
 impl fmt::Debug for OrchestratorMessage {
@@ -127,6 +147,12 @@ impl fmt::Debug for OrchestratorMessage {
                 write!(f, "StreamAgent(agent={agent_id}, session={session_id})"),
             Self::GetAgents { .. } =>
                 write!(f, "GetAgents"),
+            Self::ExecuteWorkflow { workflow, .. } =>
+                write!(f, "ExecuteWorkflow({})", workflow.name),
+            Self::StreamWorkflow { workflow, .. } =>
+                write!(f, "StreamWorkflow({})", workflow.name),
+            Self::GetWorkflowStatus { workflow_id, .. } =>
+                write!(f, "GetWorkflowStatus({workflow_id})"),
         }
     }
 }
@@ -260,6 +286,56 @@ impl Actor for OrchestratorActor {
             OrchestratorMessage::GetAgents { reply_to } => {
                 let agents: Vec<AgentInfo> = self.agent_registry.values().cloned().collect();
                 let _ = reply_to.send(agents);
+                Box::pin(async {})
+            }
+
+            // ── Workflow execution ──
+            OrchestratorMessage::ExecuteWorkflow { workflow, reply_to } => {
+                let wf_id = workflow.id;
+                self.workflows.insert(wf_id, workflow.clone());
+                let profiles = self.agent_profiles.clone();
+                let conv   = self.deps.conversation_store.clone();
+                let tools  = self.deps.tool_registry.clone();
+                let claude = self.deps.claude_client.clone();
+                let gemini = self.deps.gemini_client.clone();
+                let openai = self.deps.openai_client.clone();
+                let cfg    = self.deps.llm_config.clone();
+                let prov   = self.deps.llm_provider.clone();
+
+                tokio::spawn(async move {
+                    let result = run_workflow_engine(
+                        workflow, conv, tools, claude, gemini, openai, cfg, prov,
+                        profiles, None,
+                    ).await;
+                    let _ = reply_to.send(result);
+                });
+                Box::pin(async {})
+            }
+
+            OrchestratorMessage::StreamWorkflow { workflow, event_tx } => {
+                let wf_id = workflow.id;
+                self.workflows.insert(wf_id, workflow.clone());
+                let profiles = self.agent_profiles.clone();
+                let conv   = self.deps.conversation_store.clone();
+                let tools  = self.deps.tool_registry.clone();
+                let claude = self.deps.claude_client.clone();
+                let gemini = self.deps.gemini_client.clone();
+                let openai = self.deps.openai_client.clone();
+                let cfg    = self.deps.llm_config.clone();
+                let prov   = self.deps.llm_provider.clone();
+
+                tokio::spawn(async move {
+                    run_workflow_engine(
+                        workflow, conv, tools, claude, gemini, openai, cfg, prov,
+                        profiles, Some(event_tx),
+                    ).await.ok();
+                });
+                Box::pin(async {})
+            }
+
+            OrchestratorMessage::GetWorkflowStatus { workflow_id, reply_to } => {
+                let status = self.workflows.get(&workflow_id).map(|w| w.status.clone());
+                let _ = reply_to.send(status);
                 Box::pin(async {})
             }
         }
@@ -780,4 +856,148 @@ async fn run_stream_loop(
         "input_tokens": total_input,
         "output_tokens": total_output
     })).await;
+}
+
+// ─── Workflow execution engine ────────────────────────────────────────────────
+
+/// Execute all steps in topological (dependency) order.
+/// Each step gets its own LLM call via `run_query_loop`.
+/// If `event_tx` is `Some`, SSE events are emitted throughout.
+#[allow(clippy::too_many_arguments)]
+async fn run_workflow_engine(
+    mut workflow: Workflow,
+    conv:         Arc<PgConversationStore>,
+    tools:        Arc<RwLock<ToolRegistry>>,
+    claude:       Arc<ClaudeClient>,
+    gemini:       Option<Arc<GeminiClient>>,
+    openai:       Option<Arc<OpenAIClient>>,
+    cfg:          LlmConfig,
+    provider:     String,
+    profiles:     HashMap<String, AgentProfile>,
+    event_tx:     Option<mpsc::Sender<String>>,
+) -> Result<WorkflowResult, String> {
+    let wf_id   = workflow.id;
+    let wf_name = workflow.name.clone();
+
+    if let Some(tx) = &event_tx {
+        emit_event(tx, serde_json::json!({
+            "type": "workflow_start",
+            "workflow_id": wf_id,
+            "name": wf_name,
+            "total_steps": workflow.steps.len()
+        })).await;
+    }
+
+    let order = match topological_sort(&workflow.steps) {
+        Ok(o)  => o,
+        Err(e) => {
+            if let Some(tx) = &event_tx {
+                emit_event(tx, serde_json::json!({"type":"error","message": e})).await;
+            }
+            return Err(e);
+        }
+    };
+
+    let mut context: HashMap<String, serde_json::Value> = workflow.context.clone();
+    let mut completed_steps: Vec<String> = Vec::new();
+
+    for (exec_idx, &step_idx) in order.iter().enumerate() {
+        let step      = workflow.steps[step_idx].clone();
+        let step_id   = step.step_id.clone();
+        let agent_type = step.agent_type.clone();
+
+        workflow.status = WorkflowStatus::Running { current_step: exec_idx };
+
+        if let Some(tx) = &event_tx {
+            emit_event(tx, serde_json::json!({
+                "type": "step_start",
+                "step_id": step_id,
+                "agent_type": agent_type,
+                "step_index": exec_idx
+            })).await;
+        }
+
+        let content  = build_step_content(&step, &context);
+        let profile  = profiles.get(&agent_type).cloned().unwrap_or_default();
+        let step_sid = Uuid::new_v4();
+        let timeout  = Duration::from_millis(step.timeout_ms);
+
+        let result = tokio::time::timeout(
+            timeout,
+            run_query_loop(
+                agent_type.clone(), content, step_sid,
+                "workflow".to_string(), "system".to_string(),
+                conv.clone(), tools.clone(),
+                claude.clone(), gemini.clone(), openai.clone(),
+                cfg.clone(), provider.clone(), profile,
+            ),
+        ).await;
+
+        match result {
+            Ok(Ok(qr)) => {
+                context.insert(
+                    step.output_key.clone(),
+                    serde_json::Value::String(qr.response.clone()),
+                );
+                completed_steps.push(step_id.clone());
+
+                if let Some(tx) = &event_tx {
+                    emit_event(tx, serde_json::json!({
+                        "type": "step_complete",
+                        "step_id": step_id,
+                        "output_key": step.output_key,
+                        "response": qr.response,
+                        "tools_used": qr.tools_used
+                    })).await;
+                }
+            }
+            Ok(Err(e)) => {
+                workflow.status = WorkflowStatus::Failed { at_step: exec_idx, error: e.clone() };
+                if let Some(tx) = &event_tx {
+                    emit_event(tx, serde_json::json!({
+                        "type": "step_failed", "step_id": step_id, "error": e
+                    })).await;
+                }
+                return Ok(WorkflowResult {
+                    workflow_id: wf_id, name: wf_name, status: workflow.status,
+                    context, completed_steps,
+                    failed_step: Some(step_id), error: Some(e),
+                });
+            }
+            Err(_) => {
+                let e = format!("Step '{step_id}' timed out after {}ms", step.timeout_ms);
+                workflow.status = WorkflowStatus::Failed { at_step: exec_idx, error: e.clone() };
+                if let Some(tx) = &event_tx {
+                    emit_event(tx, serde_json::json!({
+                        "type": "step_timeout", "step_id": step_id,
+                        "timeout_ms": step.timeout_ms
+                    })).await;
+                }
+                return Ok(WorkflowResult {
+                    workflow_id: wf_id, name: wf_name, status: workflow.status,
+                    context, completed_steps,
+                    failed_step: Some(step_id), error: Some(e),
+                });
+            }
+        }
+    }
+
+    workflow.status = WorkflowStatus::Completed;
+    if let Some(tx) = &event_tx {
+        emit_event(tx, serde_json::json!({
+            "type": "workflow_complete",
+            "workflow_id": wf_id,
+            "completed_steps": completed_steps
+        })).await;
+    }
+
+    Ok(WorkflowResult {
+        workflow_id: wf_id,
+        name:        wf_name,
+        status:      WorkflowStatus::Completed,
+        context,
+        completed_steps,
+        failed_step: None,
+        error:       None,
+    })
 }
