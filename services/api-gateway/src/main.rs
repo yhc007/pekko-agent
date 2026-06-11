@@ -1,22 +1,24 @@
 use axum::{
-    extract::{Path, State, Json},
+    async_trait,
+    extract::{FromRequestParts, Path, State, Json},
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    http::{request::Parts, StatusCode, header},
     routing::{get, post},
     Router,
-    http::StatusCode,
     response::{IntoResponse, sse::{Event, KeepAlive, Sse}},
 };
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tower_http::timeout::TimeoutLayer;
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use futures::stream;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use tracing::{info, error};
+use tracing::{info, warn, error};
 
 use pekko_actor::ActorRef;
 use pekko_agent_core::{TokenUsage, ShortTermMemory, AgentInfo, AgentStatus};
@@ -25,13 +27,19 @@ use pekko_agent_tools::{ToolRegistry, builtin::{PermitSearchTool, ComplianceChec
 use pekko_agent_memory::PgConversationStore;
 use pekko_agent_orchestrator::{OrchestratorActor, OrchestratorDeps, OrchestratorMessage};
 use pekko_agent_events::EventPublisher;
-use pekko_agent_security::AuditLogger;
+use pekko_agent_security::{AuditLogger, AuditEntry, AuditOutcome, Claims, JwtError, JwtManager, RbacManager};
 use sqlx::PgPool;
 
-// ── Timeouts ──────────────────────────────────────────────────────────────────
-// Applied to blocking routes only. Streaming routes (SSE, WS) have no
-// response-body timeout since the connection is intentionally long-lived.
+// ── Constants ─────────────────────────────────────────────────────────────────
 const BLOCKING_TIMEOUT: Duration = Duration::from_secs(60);
+
+// ── API key entry (replaces a user-store for now) ─────────────────────────────
+#[derive(Clone)]
+struct ApiKeyEntry {
+    user_id:   String,
+    tenant_id: String,
+    roles:     Vec<String>,
+}
 
 // ── Shared application state ──────────────────────────────────────────────────
 #[derive(Clone)]
@@ -41,9 +49,91 @@ struct AppState {
     orchestrator_ref:   ActorRef<OrchestratorActor>,
     event_publisher:    Arc<EventPublisher>,
     audit_logger:       Arc<AuditLogger>,
+    jwt_manager:        Arc<JwtManager>,
+    rbac:               Arc<RwLock<RbacManager>>,
+    /// API-key → user identity map.  Keyed by the raw key string.
+    api_keys:           Arc<HashMap<String, ApiKeyEntry>>,
+}
+
+// ── JWT extractor ─────────────────────────────────────────────────────────────
+
+/// Extracted from a valid `Authorization: Bearer <token>` header.
+/// Adding this as a parameter to a handler makes that route require auth.
+struct AuthUser(Claims);
+
+#[async_trait]
+impl FromRequestParts<AppState> for AuthUser {
+    type Rejection = (StatusCode, Json<ErrorResponse>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let raw = parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| unauthorized("Missing Authorization header"))?;
+
+        let token = raw
+            .strip_prefix("Bearer ")
+            .ok_or_else(|| unauthorized("Authorization header must be 'Bearer <token>'"))?;
+
+        let claims = state.jwt_manager.validate(token).map_err(|e| match e {
+            JwtError::Expired    => unauthorized("Token has expired — please re-authenticate"),
+            JwtError::Invalid(_) => unauthorized("Token is invalid"),
+            JwtError::Encode(_)  => unreachable!(),
+        })?;
+
+        Ok(AuthUser(claims))
+    }
+}
+
+// ── RBAC helper ───────────────────────────────────────────────────────────────
+
+async fn require_permission(
+    state: &AppState,
+    claims: &Claims,
+    permission: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if state.rbac.read().await.check_user_permission(&claims.roles, permission) {
+        Ok(())
+    } else {
+        warn!(
+            user = %claims.sub,
+            tenant = %claims.tenant_id,
+            permission,
+            roles = ?claims.roles,
+            "Permission denied"
+        );
+        Err(forbidden(format!(
+            "Role(s) {:?} do not grant '{permission}'",
+            claims.roles
+        )))
+    }
 }
 
 // ── Request / Response types ──────────────────────────────────────────────────
+
+/// POST /api/auth/token
+#[derive(Deserialize)]
+struct AuthRequest {
+    api_key:   String,
+    /// Optional override; defaults to the key's registered tenant.
+    #[serde(default)]
+    tenant_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AuthResponse {
+    token:      String,
+    token_type: &'static str,
+    expires_in: u64,
+    tenant_id:  String,
+    user_id:    String,
+    roles:      Vec<String>,
+}
+
 #[derive(Deserialize)]
 struct QueryRequest {
     content: String,
@@ -55,7 +145,6 @@ struct QueryRequest {
     user_id: String,
 }
 
-/// Incoming WebSocket message from the client.
 #[derive(Deserialize)]
 struct WsQueryRequest {
     content: String,
@@ -100,25 +189,34 @@ struct ErrorResponse {
 }
 
 // ── Error helpers ──────────────────────────────────────────────────────────────
+
+fn make_error(status: StatusCode, code: &str, msg: impl Into<String>)
+    -> (StatusCode, Json<ErrorResponse>)
+{
+    (status, Json(ErrorResponse { error: msg.into(), code: code.to_string() }))
+}
+
 fn internal_error(msg: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
     let msg = msg.into();
     error!("{}", msg);
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-        error: msg,
-        code: "INTERNAL_ERROR".into(),
-    }))
+    make_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", msg)
 }
 
 fn service_unavailable(msg: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
-    (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse {
-        error: msg.into(),
-        code: "ACTOR_UNAVAILABLE".into(),
-    }))
+    make_error(StatusCode::SERVICE_UNAVAILABLE, "ACTOR_UNAVAILABLE", msg)
+}
+
+fn unauthorized(msg: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
+    make_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", msg)
+}
+
+fn forbidden(msg: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
+    make_error(StatusCode::FORBIDDEN, "FORBIDDEN", msg)
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-/// GET /api/health
+/// GET /api/health  — public, no auth required
 async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     let tool_count = state.tool_registry.read().await.list_tools().len();
 
@@ -143,10 +241,40 @@ async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
-/// GET /api/agents
+/// POST /api/auth/token  — public; exchange API key for a JWT
+async fn issue_token(
+    State(state): State<AppState>,
+    Json(req):    Json<AuthRequest>,
+) -> Result<Json<AuthResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let entry = state.api_keys.get(&req.api_key)
+        .ok_or_else(|| unauthorized("Invalid API key"))?;
+
+    let tenant_id = req.tenant_id
+        .unwrap_or_else(|| entry.tenant_id.clone());
+
+    let token = state.jwt_manager
+        .issue(&entry.user_id, &tenant_id, entry.roles.clone())
+        .map_err(|e| internal_error(format!("Token issuance failed: {e}")))?;
+
+    info!(user = %entry.user_id, tenant = %tenant_id, "JWT issued");
+
+    Ok(Json(AuthResponse {
+        token,
+        token_type: "Bearer",
+        expires_in: state.jwt_manager.token_ttl_seconds,
+        tenant_id,
+        user_id: entry.user_id.clone(),
+        roles:   entry.roles.clone(),
+    }))
+}
+
+/// GET /api/agents  — requires memory.read
 async fn list_agents(
+    auth:         AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<AgentInfo>>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "memory.read").await?;
+
     let (reply_tx, reply_rx) = oneshot::channel::<Vec<AgentInfo>>();
     state.orchestrator_ref
         .tell(OrchestratorMessage::GetAgents { reply_to: reply_tx })
@@ -156,34 +284,43 @@ async fn list_agents(
     Ok(Json(agents))
 }
 
-/// POST /api/agents/:agent_id/query  — blocking request-reply
+/// POST /api/agents/:agent_id/query  — requires agent.delegate
 async fn query_agent(
+    auth:           AuthUser,
     Path(agent_id): Path<String>,
     State(state):   State<AppState>,
     Json(req):      Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let session_id = req.session_id.unwrap_or_else(Uuid::new_v4);
+    require_permission(&state, &auth.0, "agent.delegate").await?;
 
-    info!(agent_id = %agent_id, session_id = %session_id, "Agent query → OrchestratorActor");
+    let session_id = req.session_id.unwrap_or_else(Uuid::new_v4);
+    let user_id    = auth.0.sub.clone();
+    let tenant_id  = auth.0.tenant_id.clone();
+
+    info!(
+        agent_id = %agent_id, session_id = %session_id,
+        user = %user_id, tenant = %tenant_id,
+        "Agent query → OrchestratorActor"
+    );
 
     let event = pekko_agent_events::AgentEventEnvelope::new(
         "api-gateway",
         pekko_agent_events::event_types::TASK_ASSIGNED,
-        &req.tenant_id,
+        &tenant_id,
         session_id,
-        serde_json::json!({ "agent_id": agent_id, "content": req.content }),
+        serde_json::json!({ "agent_id": agent_id, "content": req.content, "user_id": user_id }),
     );
     let _ = state.event_publisher.publish(event).await;
 
-    state.audit_logger.log(pekko_agent_security::AuditEntry {
+    state.audit_logger.log(AuditEntry {
         id:        Uuid::new_v4(),
         timestamp: chrono::Utc::now(),
-        tenant_id: req.tenant_id.clone(),
+        tenant_id: tenant_id.clone(),
         agent_id:  agent_id.clone(),
         action:    "query".to_string(),
         resource:  format!("agent/{agent_id}"),
-        outcome:   pekko_agent_security::AuditOutcome::Success,
-        details:   serde_json::json!({ "session_id": session_id }),
+        outcome:   AuditOutcome::Success,
+        details:   serde_json::json!({ "session_id": session_id, "user_id": user_id }),
     }).await;
 
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -192,8 +329,8 @@ async fn query_agent(
             agent_id:   agent_id.clone(),
             content:    req.content,
             session_id,
-            tenant_id:  req.tenant_id,
-            user_id:    req.user_id,
+            tenant_id,
+            user_id,
             reply_to:   reply_tx,
         })
         .map_err(|_| service_unavailable("Orchestrator actor unavailable"))?;
@@ -214,29 +351,29 @@ async fn query_agent(
     }))
 }
 
-/// POST /api/agents/:agent_id/query/stream  — SSE streaming
-///
-/// Uses a bounded channel (256) so a slow browser can apply backpressure.
-/// No TimeoutLayer here — the connection is intentionally long-lived.
+/// POST /api/agents/:agent_id/query/stream  — requires agent.delegate, SSE
 async fn stream_query_agent(
+    auth:           AuthUser,
     Path(agent_id): Path<String>,
     State(state):   State<AppState>,
     Json(req):      Json<QueryRequest>,
-) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "agent.delegate").await?;
+
     let session_id = req.session_id.unwrap_or_else(Uuid::new_v4);
+    let tenant_id  = auth.0.tenant_id.clone();
+    let user_id    = auth.0.sub.clone();
 
-    info!(agent_id = %agent_id, session_id = %session_id, "SSE stream → OrchestratorActor");
+    info!(agent_id = %agent_id, session_id = %session_id, user = %user_id, "SSE stream → OrchestratorActor");
 
-    // Bounded: if the browser stalls, the actor's emit_event().await yields,
-    // creating natural backpressure instead of unbounded memory growth.
     let (event_tx, event_rx) = mpsc::channel::<String>(256);
 
     let result = state.orchestrator_ref.tell(OrchestratorMessage::StreamAgent {
         agent_id,
         content:   req.content,
         session_id,
-        tenant_id: req.tenant_id,
-        user_id:   req.user_id,
+        tenant_id,
+        user_id,
         event_tx:  event_tx.clone(),
     });
 
@@ -252,41 +389,62 @@ async fn stream_query_agent(
         })
     });
 
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-/// GET /api/agents/:agent_id/ws  — WebSocket bidirectional streaming
+/// GET /api/agents/:agent_id/ws  — requires agent.delegate, WebSocket
 ///
-/// Protocol:
-///   Client → Server: JSON `{"content":"...", "session_id":"<uuid>", ...}`
-///   Server → Client: same JSON event stream as SSE
-///                    (thinking / tool_use / tool_result / text_chunk / done / error)
-///
-/// Multiple queries per connection are supported — send a new JSON message
-/// after receiving `{"type":"done", ...}` from the previous one.
+/// Token is passed as query param `?token=<jwt>` since browsers cannot set
+/// Authorization headers on WebSocket upgrades.
 async fn ws_agent(
     Path(agent_id): Path<String>,
     State(state):   State<AppState>,
-    ws:             WebSocketUpgrade,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| ws_agent_handler(socket, state, agent_id))
+    // Validate JWT from query param (browsers can't set WS headers)
+    let token = match params.get("token") {
+        Some(t) => t.clone(),
+        None    => return unauthorized("Missing 'token' query parameter").into_response(),
+    };
+
+    let claims = match state.jwt_manager.validate(&token) {
+        Ok(c)  => c,
+        Err(JwtError::Expired)    => return unauthorized("Token has expired").into_response(),
+        Err(JwtError::Invalid(_)) => return unauthorized("Invalid token").into_response(),
+        Err(JwtError::Encode(_))  => unreachable!(),
+    };
+
+    // RBAC check before upgrade
+    let has_perm = state.rbac.read().await
+        .check_user_permission(&claims.roles, "agent.delegate");
+    if !has_perm {
+        return forbidden(format!(
+            "Role(s) {:?} do not grant 'agent.delegate'", claims.roles
+        )).into_response();
+    }
+
+    ws.on_upgrade(move |socket| ws_agent_handler(socket, state, agent_id, claims))
 }
 
-async fn ws_agent_handler(mut socket: WebSocket, state: AppState, agent_id: String) {
-    info!(agent_id = %agent_id, "WebSocket connection opened");
+async fn ws_agent_handler(
+    mut socket:  WebSocket,
+    state:       AppState,
+    agent_id:    String,
+    claims:      Claims,
+) {
+    info!(agent_id = %agent_id, user = %claims.sub, "WebSocket connection opened");
 
     loop {
-        // Wait for a query from the client
         let msg = match socket.recv().await {
             Some(Ok(m))  => m,
             Some(Err(e)) => { error!(error = %e, "WS recv error"); break; }
-            None         => break, // Connection closed
+            None         => break,
         };
 
         let text = match msg {
             Message::Text(t)  => t,
             Message::Close(_) => break,
-            // axum 0.7 auto-responds to Ping with Pong; skip other frames
             _ => continue,
         };
 
@@ -300,10 +458,10 @@ async fn ws_agent_handler(mut socket: WebSocket, state: AppState, agent_id: Stri
         };
 
         let session_id = req.session_id.unwrap_or_else(Uuid::new_v4);
-        let tenant_id  = req.tenant_id.unwrap_or_else(default_tenant);
-        let user_id    = req.user_id.unwrap_or_else(default_user);
+        let tenant_id  = req.tenant_id.unwrap_or_else(|| claims.tenant_id.clone());
+        let user_id    = req.user_id.unwrap_or_else(|| claims.sub.clone());
 
-        info!(agent_id = %agent_id, session_id = %session_id, "WS query received");
+        info!(agent_id = %agent_id, session_id = %session_id, user = %user_id, "WS query received");
 
         let (event_tx, mut event_rx) = mpsc::channel::<String>(256);
 
@@ -322,8 +480,6 @@ async fn ws_agent_handler(mut socket: WebSocket, state: AppState, agent_id: Stri
             continue;
         }
 
-        // Forward every event from the actor to the WebSocket client.
-        // Stops early if the client disconnects.
         while let Some(data) = event_rx.recv().await {
             if socket.send(Message::Text(data)).await.is_err() {
                 info!(agent_id = %agent_id, "WS client disconnected mid-stream");
@@ -332,25 +488,33 @@ async fn ws_agent_handler(mut socket: WebSocket, state: AppState, agent_id: Stri
         }
     }
 
-    info!(agent_id = %agent_id, "WebSocket connection closed");
+    info!(agent_id = %agent_id, user = %claims.sub, "WebSocket connection closed");
 }
 
-/// GET /api/sessions/:session_id/history
+/// GET /api/sessions/:session_id/history  — requires memory.read
 async fn get_session_history(
-    Path(session_id): Path<Uuid>,
-    State(state):     State<AppState>,
-) -> impl IntoResponse {
+    auth:              AuthUser,
+    Path(session_id):  Path<Uuid>,
+    State(state):      State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "memory.read").await?;
+
     let messages = state.conversation_store
         .get_conversation(&session_id)
         .await
         .unwrap_or_default();
-    Json(messages)
+    Ok(Json(messages))
 }
 
-/// GET /api/tools
-async fn list_tools(State(state): State<AppState>) -> impl IntoResponse {
+/// GET /api/tools  — requires memory.read
+async fn list_tools(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "memory.read").await?;
+
     let registry = state.tool_registry.read().await;
-    Json(registry.list_tools())
+    Ok(Json(registry.list_tools()))
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -363,6 +527,43 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     info!("Starting pekko-agent API Gateway");
+
+    // ── JWT + Auth ────────────────────────────────────────────────────────────
+    let jwt_secret = std::env::var("JWT_SECRET")
+        .unwrap_or_else(|_| {
+            warn!("JWT_SECRET not set — using insecure default (set it in production!)");
+            "change-me-in-production-32-chars!!".to_string()
+        });
+
+    let jwt_ttl: u64 = std::env::var("JWT_TTL_SECONDS")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(3600);
+
+    let jwt_manager = Arc::new(JwtManager::new(jwt_secret.as_bytes()).with_ttl(jwt_ttl));
+
+    // API keys — keyed by raw key string.
+    // Production: store hashed keys in DB.
+    let mut api_keys: HashMap<String, ApiKeyEntry> = HashMap::new();
+
+    if let Ok(key) = std::env::var("ADMIN_API_KEY") {
+        api_keys.insert(key, ApiKeyEntry {
+            user_id:   "admin".to_string(),
+            tenant_id: "default".to_string(),
+            roles:     vec!["admin".to_string()],
+        });
+    } else {
+        warn!("ADMIN_API_KEY not set — no admin access possible");
+    }
+
+    if let Ok(key) = std::env::var("AGENT_API_KEY") {
+        api_keys.insert(key, ApiKeyEntry {
+            user_id:   "agent-service".to_string(),
+            tenant_id: "default".to_string(),
+            roles:     vec!["agent".to_string()],
+        });
+    }
+
+    let api_keys = Arc::new(api_keys);
+    let rbac     = Arc::new(RwLock::new(RbacManager::new()));
 
     // ── LLM config ────────────────────────────────────────────────────────────
     let llm_config = LlmConfig {
@@ -425,7 +626,6 @@ async fn main() -> anyhow::Result<()> {
         .spawn(OrchestratorActor::new(deps), "orchestrator").await
         .expect("Failed to spawn OrchestratorActor");
 
-    // Register agents via Actor messages (actor is the single source of truth)
     let agents = [
         AgentInfo {
             agent_id:     "ehs-permit-agent".into(),
@@ -466,22 +666,31 @@ async fn main() -> anyhow::Result<()> {
         orchestrator_ref,
         event_publisher,
         audit_logger,
+        jwt_manager,
+        rbac,
+        api_keys,
     };
 
     // ── Router ────────────────────────────────────────────────────────────────
     //
-    // Blocking routes → wrapped with TimeoutLayer (60 s).
-    // Streaming routes (SSE, WS) → no response timeout; connection is long-lived.
+    // Public:    /api/health, /api/auth/token
+    // Protected: everything else
     //
-    let blocking = Router::new()
-        .route("/api/health",                        get(health_check))
+    // Blocking routes wrapped in TimeoutLayer(60s).
+    // Streaming routes (SSE, WS) have no response timeout.
+    //
+    let public_routes = Router::new()
+        .route("/api/health",      get(health_check))
+        .route("/api/auth/token",  post(issue_token));
+
+    let blocking_protected = Router::new()
         .route("/api/agents",                        get(list_agents))
         .route("/api/agents/:agent_id/query",        post(query_agent))
         .route("/api/sessions/:session_id/history",  get(get_session_history))
         .route("/api/tools",                         get(list_tools))
         .layer(TimeoutLayer::new(BLOCKING_TIMEOUT));
 
-    let streaming = Router::new()
+    let streaming_protected = Router::new()
         .route("/api/agents/:agent_id/query/stream", post(stream_query_agent))
         .route("/api/agents/:agent_id/ws",           get(ws_agent));
 
@@ -489,8 +698,9 @@ async fn main() -> anyhow::Result<()> {
         .ok().and_then(|v| v.parse().ok()).unwrap_or(8080);
 
     let app = Router::new()
-        .merge(blocking)
-        .merge(streaming)
+        .merge(public_routes)
+        .merge(blocking_protected)
+        .merge(streaming_protected)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);

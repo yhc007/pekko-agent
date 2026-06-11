@@ -90,4 +90,14 @@ impl RbacManager {
             .map(|perms| perms.iter().collect())
             .unwrap_or_default()
     }
+
+    /// Check whether any of the provided `roles` (from a JWT token) grants `required`.
+    /// Used by HTTP handlers after the JWT extractor has already validated the token.
+    pub fn check_user_permission(&self, roles: &[String], required: &str) -> bool {
+        roles.iter().any(|role| {
+            self.roles.get(role.as_str())
+                .map(|perms| perms.iter().any(|p| p.matches(required)))
+                .unwrap_or(false)
+        })
+    }
 }
