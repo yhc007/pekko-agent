@@ -96,8 +96,14 @@ pub fn message_bubble(props: &MessageProps) -> Html {
     }
 }
 
+#[derive(Properties, PartialEq)]
+pub struct TypingProps {
+    #[prop_or_default]
+    pub status: Option<String>,
+}
+
 #[function_component(TypingIndicator)]
-pub fn typing_indicator() -> Html {
+pub fn typing_indicator(props: &TypingProps) -> Html {
     html! {
         <div class="message-row assistant">
             <div class="message-avatar">{ "AI" }</div>
@@ -105,6 +111,9 @@ pub fn typing_indicator() -> Html {
                 <div class="typing-dot"></div>
                 <div class="typing-dot"></div>
                 <div class="typing-dot"></div>
+                if let Some(ref status) = props.status {
+                    <span class="typing-status">{ status }</span>
+                }
             </div>
         </div>
     }

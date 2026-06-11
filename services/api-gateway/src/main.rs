@@ -3,14 +3,16 @@ use axum::{
     routing::{get, post},
     Router,
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, sse::{Event, KeepAlive, Sse}},
 };
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use std::sync::Arc;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
+use futures::stream;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use tracing::{info, error, warn};
@@ -483,6 +485,199 @@ async fn query_agent(
     }))
 }
 
+/// POST /api/agents/:agent_id/query/stream - Submit a query and stream SSE events
+///
+/// SSE events (each as `data: <JSON>\n\n`):
+///   {"type":"thinking","round":N}
+///   {"type":"tool_use","tool":"name","round":N}
+///   {"type":"tool_result","tool":"name","ok":bool}
+///   {"type":"text_chunk","text":"..."}
+///   {"type":"done","session_id":"...","tools_used":[...],"input_tokens":N,"output_tokens":N}
+///   {"type":"error","message":"..."}
+async fn stream_query_agent(
+    Path(agent_id): Path<String>,
+    State(state): State<AppState>,
+    Json(req): Json<QueryRequest>,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let (tx, rx) = mpsc::unbounded_channel::<String>();
+
+    tokio::spawn(async move {
+        macro_rules! emit {
+            ($($tt:tt)*) => {
+                let _ = tx.send(serde_json::json!($($tt)*).to_string());
+            };
+        }
+
+        let session_id = req.session_id.unwrap_or_else(Uuid::new_v4);
+        info!(agent_id = %agent_id, session_id = %session_id, "SSE stream started");
+
+        // Store user message
+        let conv_store = state.conversation_store.clone();
+        let _ = conv_store.append_message(&session_id, Message::user(&req.content)).await;
+
+        // Build conversation history
+        let history = conv_store.get_conversation(&session_id).await.unwrap_or_default();
+        let claude_messages: Vec<ClaudeMessage> = history.iter().map(|m| ClaudeMessage {
+            role: match m.role {
+                pekko_agent_core::MessageRole::User => "user".to_string(),
+                pekko_agent_core::MessageRole::Assistant => "assistant".to_string(),
+                _ => "user".to_string(),
+            },
+            content: vec![ContentBlock::Text { text: m.content.clone() }],
+        }).collect();
+
+        let tool_defs = {
+            let registry = state.tool_registry.read().await;
+            registry.list_tools()
+        };
+        let claude_tools = tool_definitions_to_claude_tools(&tool_defs);
+        let system_prompt = build_system_prompt(&agent_id);
+
+        let mut messages = claude_messages;
+        let mut all_tools_used: Vec<String> = Vec::new();
+        let mut total_input_tokens: u32 = 0;
+        let mut total_output_tokens: u32 = 0;
+        let mut final_text = String::new();
+
+        'outer: for round in 0..MAX_TOOL_ROUNDS {
+            emit!({"type": "thinking", "round": round});
+
+            let llm_request = LlmRequest {
+                system_prompt: system_prompt.clone(),
+                messages: messages.clone(),
+                tools: claude_tools.clone(),
+                max_tokens: state.llm_config.max_tokens,
+                temperature: Some(state.llm_config.temperature),
+                cacheable: false,
+            };
+
+            let resp = if state.llm_provider == "openai" {
+                match state.openai_client.as_ref() {
+                    Some(c) => match c.send_message(&llm_request).await {
+                        Ok(r) => r,
+                        Err(e) => { emit!({"type":"error","message": format!("OpenAI 오류: {e}")}); break 'outer; }
+                    },
+                    None => { emit!({"type":"error","message":"OpenAI API 키가 없습니다"}); break 'outer; }
+                }
+            } else if state.llm_provider == "gemini" {
+                match state.gemini_client.as_ref() {
+                    Some(c) => match c.send_message(&llm_request).await {
+                        Ok(r) => r,
+                        Err(e) => { emit!({"type":"error","message": format!("Gemini 오류: {e}")}); break 'outer; }
+                    },
+                    None => { emit!({"type":"error","message":"Gemini API 키가 없습니다"}); break 'outer; }
+                }
+            } else {
+                match state.claude_client.send_message(&llm_request).await {
+                    Ok(r) => r,
+                    Err(e) => { emit!({"type":"error","message": format!("Claude 오류: {e}")}); break 'outer; }
+                }
+            };
+
+            total_input_tokens += resp.usage.input_tokens;
+            total_output_tokens += resp.usage.output_tokens;
+
+            if resp.stop_reason == "tool_use" {
+                let mut assistant_content: Vec<ContentBlock> = Vec::new();
+                let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
+
+                for block in &resp.content {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            assistant_content.push(ContentBlock::Text { text: text.clone() });
+                        }
+                        ContentBlock::ToolUse { id, name, input } => {
+                            assistant_content.push(ContentBlock::ToolUse {
+                                id: id.clone(), name: name.clone(), input: input.clone(),
+                            });
+                            tool_uses.push((id.clone(), name.clone(), input.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+                messages.push(ClaudeMessage { role: "assistant".to_string(), content: assistant_content });
+
+                let tool_ctx = ToolContext {
+                    tenant_id: req.tenant_id.clone(),
+                    user_id: req.user_id.clone(),
+                    session_id,
+                    credentials: HashMap::new(),
+                    timeout: Duration::from_secs(10),
+                };
+                let mut tool_results: Vec<ContentBlock> = Vec::new();
+
+                for (tool_use_id, tool_name, tool_input) in &tool_uses {
+                    emit!({"type": "tool_use", "tool": tool_name, "round": round});
+                    all_tools_used.push(tool_name.clone());
+
+                    let result = {
+                        let mut registry = state.tool_registry.write().await;
+                        registry.execute(tool_name, tool_input.clone(), &tool_ctx).await
+                    };
+
+                    let (content_str, is_error, ok) = match result {
+                        Ok(output) => {
+                            let s = truncate_tool_result(
+                                &serde_json::to_string(&output.content).unwrap_or_default()
+                            );
+                            let ok = !output.is_error;
+                            (s, if output.is_error { Some(true) } else { None }, ok)
+                        }
+                        Err(e) => {
+                            warn!(tool_name = %tool_name, error = %e, "Tool failed in SSE stream");
+                            (format!("{{\"error\":\"{e}\"}}"), Some(true), false)
+                        }
+                    };
+
+                    emit!({"type": "tool_result", "tool": tool_name, "ok": ok});
+                    tool_results.push(ContentBlock::ToolResult {
+                        tool_use_id: tool_use_id.clone(),
+                        content: content_str,
+                        is_error,
+                    });
+                }
+
+                messages.push(ClaudeMessage { role: "user".to_string(), content: tool_results });
+                continue;
+            }
+
+            // end_turn — collect final text
+            for block in &resp.content {
+                if let ContentBlock::Text { text } = block {
+                    if !final_text.is_empty() { final_text.push('\n'); }
+                    final_text.push_str(text);
+                }
+            }
+            break;
+        }
+
+        // Store assistant response
+        let _ = conv_store.append_message(&session_id, Message::assistant(&final_text)).await;
+
+        all_tools_used.sort();
+        all_tools_used.dedup();
+
+        emit!({"type": "text_chunk", "text": final_text});
+        emit!({
+            "type": "done",
+            "session_id": session_id,
+            "tools_used": all_tools_used,
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens
+        });
+        // tx is dropped here → stream terminates
+    });
+
+    let stream = stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|data| {
+            let event = Ok::<Event, Infallible>(Event::default().data(data));
+            (event, rx)
+        })
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
 /// GET /api/sessions/:session_id/history - Get conversation history for a session
 async fn get_session_history(
     Path(session_id): Path<Uuid>,
@@ -633,6 +828,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/health", get(health_check))
         .route("/api/agents", get(list_agents))
         .route("/api/agents/:agent_id/query", post(query_agent))
+        .route("/api/agents/:agent_id/query/stream", post(stream_query_agent))
         .route("/api/sessions/:session_id/history", get(get_session_history))
         .route("/api/tools", get(list_tools))
         .layer(CorsLayer::permissive())

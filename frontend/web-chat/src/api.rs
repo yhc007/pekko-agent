@@ -1,5 +1,7 @@
 use gloo_net::http::Request;
 use uuid::Uuid;
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::JsFuture;
 
 use crate::types::*;
 
@@ -92,6 +94,99 @@ pub async fn send_query(
             .unwrap_or_else(|_| format!("HTTP {}", resp.status()));
         Err(err)
     }
+}
+
+/// POST /api/agents/:agent_id/query/stream  — Fetch-based SSE streaming.
+///
+/// Calls `on_event` for each SSE event received.
+/// Returns Ok(()) when the stream ends cleanly, or Err(message) on network/parse errors.
+pub async fn stream_query<F: FnMut(StreamEvent)>(
+    agent_id: &str,
+    content: &str,
+    session_id: Option<Uuid>,
+    mut on_event: F,
+) -> Result<(), String> {
+    let url = format!("{}/api/agents/{}/query/stream", base_url(), agent_id);
+    let body = QueryRequest {
+        content: content.to_string(),
+        session_id,
+        tenant_id: "default".to_string(),
+        user_id: "web-user".to_string(),
+    };
+    let body_json = serde_json::to_string(&body).map_err(|e| format!("직렬화 오류: {e}"))?;
+
+    // Build Fetch request with POST + JSON body
+    let headers = web_sys::Headers::new()
+        .map_err(|e| format!("Headers 오류: {:?}", e))?;
+    headers.append("Content-Type", "application/json")
+        .map_err(|e| format!("Header 설정 오류: {:?}", e))?;
+
+    let opts = web_sys::RequestInit::new();
+    opts.set_method("POST");
+    opts.set_mode(web_sys::RequestMode::Cors);
+    opts.set_headers(&headers);
+    opts.set_body(&wasm_bindgen::JsValue::from_str(&body_json));
+
+    let request = web_sys::Request::new_with_str_and_init(&url, &opts)
+        .map_err(|e| format!("Request 오류: {:?}", e))?;
+
+    let window = web_sys::window().ok_or("window 없음")?;
+    let resp_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|e| format!("Fetch 오류: {:?}", e))?;
+
+    let resp: web_sys::Response = resp_value.dyn_into()
+        .map_err(|_| "Response 변환 실패".to_string())?;
+
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+
+    let body_stream = resp.body().ok_or("Response body 없음")?;
+    let reader_js = body_stream.get_reader();
+    let reader: web_sys::ReadableStreamDefaultReader = reader_js.dyn_into()
+        .map_err(|_| "ReadableStreamDefaultReader 변환 실패".to_string())?;
+
+    let mut buffer = String::new();
+
+    loop {
+        let chunk = JsFuture::from(reader.read())
+            .await
+            .map_err(|e| format!("스트림 읽기 오류: {:?}", e))?;
+
+        let done = js_sys::Reflect::get(&chunk, &wasm_bindgen::JsValue::from_str("done"))
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        if done {
+            break;
+        }
+
+        let value = js_sys::Reflect::get(&chunk, &wasm_bindgen::JsValue::from_str("value"))
+            .map_err(|_| "chunk.value 없음".to_string())?;
+
+        let uint8array: js_sys::Uint8Array = value.dyn_into()
+            .map_err(|_| "Uint8Array 변환 실패".to_string())?;
+
+        buffer.push_str(&String::from_utf8_lossy(&uint8array.to_vec()));
+
+        // Parse all complete SSE events from the buffer ("data: ...\n\n")
+        while let Some(idx) = buffer.find("\n\n") {
+            let block = buffer[..idx].to_string();
+            buffer = buffer[idx + 2..].to_string();
+
+            for line in block.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if let Ok(event) = serde_json::from_str::<StreamEvent>(data) {
+                        on_event(event);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// GET /api/sessions/:session_id/history

@@ -76,7 +76,26 @@ pub struct HistoryMessage {
 #[derive(Clone, Debug, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
+    #[serde(default)]
     pub code: String,
+}
+
+// ── SSE Streaming events ──
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamEvent {
+    Thinking { round: usize },
+    ToolUse { tool: String, round: usize },
+    ToolResult { tool: String, ok: bool },
+    TextChunk { text: String },
+    Done {
+        session_id: Uuid,
+        tools_used: Vec<String>,
+        input_tokens: u32,
+        output_tokens: u32,
+    },
+    Error { message: String },
 }
 
 // ── Internal Chat Message (for UI state) ──

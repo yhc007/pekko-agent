@@ -3,12 +3,17 @@ use yew::prelude::*;
 
 use crate::components::input::ChatInput;
 use crate::components::message::{MessageBubble, TypingIndicator};
+use crate::markdown;
 use crate::types::ChatMessage;
 
 #[derive(Properties, PartialEq)]
 pub struct ChatProps {
     pub messages: Vec<ChatMessage>,
     pub is_loading: bool,
+    #[prop_or_default]
+    pub streaming_status: Option<String>,
+    #[prop_or_default]
+    pub streaming_text: String,
     pub on_send: Callback<String>,
     pub on_example_click: Callback<String>,
     pub has_agent: bool,
@@ -18,12 +23,13 @@ pub struct ChatProps {
 pub fn chat_area(props: &ChatProps) -> Html {
     let messages_end_ref = use_node_ref();
 
-    // Auto-scroll to bottom when new messages arrive
+    // Auto-scroll to bottom when messages or streaming text changes
     {
         let messages_end_ref = messages_end_ref.clone();
         let msg_count = props.messages.len();
         let is_loading = props.is_loading;
-        use_effect_with((msg_count, is_loading), move |_| {
+        let has_streaming = !props.streaming_text.is_empty();
+        use_effect_with((msg_count, is_loading, has_streaming), move |_| {
             if let Some(el) = messages_end_ref.cast::<Element>() {
                 let opts = ScrollIntoViewOptions::new();
                 opts.set_behavior(ScrollBehavior::Smooth);
@@ -74,15 +80,45 @@ pub fn chat_area(props: &ChatProps) -> Html {
             </div>
         }
     } else {
+        // Streaming bubble: shown while text is arriving
+        let streaming_bubble = if !props.streaming_text.is_empty() {
+            let rendered = markdown::markdown_to_html(&props.streaming_text);
+            Html::from_html_unchecked(AttrValue::from(format!(
+                "<div class=\"message-row assistant streaming-bubble\">\
+                    <div class=\"message-avatar\">AI</div>\
+                    <div class=\"message-bubble md-content streaming\">{}</div>\
+                </div>",
+                rendered
+            )))
+        } else {
+            html! {}
+        };
+
+        // Typing indicator: only shown when loading but no text yet
+        let loading_indicator = if props.is_loading && props.streaming_text.is_empty() {
+            html! { <TypingIndicator status={props.streaming_status.clone()} /> }
+        } else if props.is_loading && !props.streaming_text.is_empty() {
+            // Show compact status badge while text is streaming
+            if let Some(ref status) = props.streaming_status {
+                Html::from_html_unchecked(AttrValue::from(format!(
+                    "<div class=\"streaming-status-badge\">{}</div>",
+                    status
+                )))
+            } else {
+                html! {}
+            }
+        } else {
+            html! {}
+        };
+
         html! {
             <>
                 <div class="messages">
                     { for props.messages.iter().map(|msg| html! {
                         <MessageBubble message={msg.clone()} />
                     })}
-                    if props.is_loading {
-                        <TypingIndicator />
-                    }
+                    { streaming_bubble }
+                    { loading_indicator }
                     <div ref={messages_end_ref}></div>
                 </div>
                 <ChatInput on_send={props.on_send.clone()} disabled={!props.has_agent || props.is_loading} />
