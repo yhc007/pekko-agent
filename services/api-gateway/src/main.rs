@@ -552,8 +552,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize tool registry with built-in tools
     let mut tool_registry = ToolRegistry::new();
-    tool_registry.register(Arc::new(PermitSearchTool));
-    tool_registry.register(Arc::new(ComplianceCheckTool));
+    tool_registry.register(Arc::new(PermitSearchTool::new(pg_pool.clone())));
+    tool_registry.register(Arc::new(ComplianceCheckTool::new(pg_pool.clone())));
     tool_registry.register(Arc::new(EhsQueryTool::new(pg_pool.clone())));
 
     info!(tools = tool_registry.list_tools().len(), "Tool registry initialized");
