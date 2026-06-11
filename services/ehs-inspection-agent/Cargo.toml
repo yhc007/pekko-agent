@@ -23,3 +23,6 @@ tracing-subscriber = { workspace = true, features = ["json"] }
 anyhow.workspace = true
 pekko-actor.workspace = true
 pekko-persistence.workspace = true
+axum.workspace = true
+reqwest = { workspace = true }
+dotenvy.workspace = true

@@ -16,7 +16,7 @@ pub enum Permission {
 impl Permission {
     pub fn matches(&self, required: &str) -> bool {
         match self {
-            Permission::AdminAll => true,
+            Permission::AdminAll => true, // admin grants every permission string
             Permission::ToolExecute(tool) => required.starts_with("tool.") && required.ends_with(tool),
             Permission::MemoryRead => required == "memory.read",
             Permission::MemoryWrite => required == "memory.write",
@@ -45,6 +45,7 @@ impl RbacManager {
 
     fn setup_default_roles(&mut self) {
         self.roles.insert("admin".to_string(), vec![Permission::AdminAll]);
+        // "viewer" role can only read, "agent" role can also delegate
         self.roles.insert("agent".to_string(), vec![
             Permission::MemoryRead,
             Permission::MemoryWrite,

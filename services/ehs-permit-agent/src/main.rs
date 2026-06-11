@@ -1,98 +1,104 @@
 mod permit_agent;
 
-use permit_agent::PermitAgentActor;
-use pekko_agent_core::*;
-use std::collections::HashMap;
-use tracing::info;
-use uuid::Uuid;
+use pekko_agent_core::{AgentInfo, AgentProfile, AgentStatus};
+use axum::{routing::get, Router, Json};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tracing::{error, info, warn};
+
+fn agent_info() -> AgentInfo {
+    AgentInfo {
+        agent_id:     "ehs-permit-agent".to_string(),
+        agent_type:   "ehs".to_string(),
+        description:  "위험작업 허가(PTW) 관리 에이전트".to_string(),
+        capabilities: vec!["permit_search".to_string(), "ehs_query".to_string()],
+        status:       AgentStatus::Available,
+    }
+}
+
+fn agent_profile() -> AgentProfile {
+    AgentProfile {
+        tool_whitelist: Some(vec![
+            "permit_search".to_string(),
+            "ehs_query".to_string(),
+        ]),
+        max_tokens_override: None,
+    }
+}
+
+#[derive(Serialize)]
+struct AuthRequest<'a> { api_key: &'a str }
+
+#[derive(Deserialize)]
+struct AuthResponse { token: String }
+
+#[derive(Serialize)]
+struct RegisterRequest { info: AgentInfo, profile: AgentProfile }
+
+async fn register(gateway_url: &str, api_key: &str) -> anyhow::Result<()> {
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let auth: AuthResponse = client
+        .post(format!("{gateway_url}/api/auth/token"))
+        .json(&AuthRequest { api_key })
+        .send().await?.error_for_status()?.json().await?;
+    client
+        .post(format!("{gateway_url}/api/agents/register"))
+        .bearer_auth(&auth.token)
+        .json(&RegisterRequest { info: agent_info(), profile: agent_profile() })
+        .send().await?.error_for_status()?;
+    Ok(())
+}
+
+async fn register_with_retry(gateway_url: String, api_key: String) {
+    let mut delay = Duration::from_secs(2);
+    for attempt in 1..=10 {
+        match register(&gateway_url, &api_key).await {
+            Ok(()) => {
+                info!(
+                    agent_id = "ehs-permit-agent",
+                    tools = ?agent_profile().tool_whitelist,
+                    "Registered with API Gateway"
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(attempt, error = %e, "Registration failed, retry in {delay:?}");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(60));
+            }
+        }
+    }
+    error!("Registration failed after 10 attempts — running in degraded mode");
+}
+
+#[derive(Serialize)]
+struct HealthResponse { status: &'static str, agent_id: &'static str, version: &'static str }
+
+async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse { status: "healthy", agent_id: "ehs-permit-agent", version: env!("CARGO_PKG_VERSION") })
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .with_target(false)
-        .with_level(true)
-        .init();
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
+        .json().init();
 
-    info!("Starting EHS Permit Agent Service");
+    let gateway_url = std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let api_key     = std::env::var("AGENT_API_KEY").unwrap_or_else(|_| { warn!("AGENT_API_KEY not set"); String::new() });
+    let port: u16   = std::env::var("EHS_PERMIT_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(8081);
 
-    let mut agent = PermitAgentActor::new("permit-agent-001");
+    info!(agent_id = "ehs-permit-agent", %gateway_url, "Starting EHS Permit Agent");
 
-    info!(
-        agent_id = agent.agent_id(),
-        tools = agent.available_tools().len(),
-        "Agent initialized"
-    );
+    tokio::spawn(register_with_retry(gateway_url, api_key));
 
-    // Demo queries to showcase functionality
-    let demo_queries = vec![
-        "Search for active environmental permits for facility FAC-001",
-        "Check compliance for our manufacturing facility FAC-002",
-        "Generate permit documents for the chemical facility FAC-003",
-    ];
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
+    info!(addr = %format!("0.0.0.0:{port}"), "EHS Permit Agent listening");
 
-    for (idx, query_text) in demo_queries.iter().enumerate() {
-        info!(query_num = idx + 1, "Processing query: {}", query_text);
-
-        let query = UserQuery {
-            session_id: Uuid::new_v4(),
-            content: query_text.to_string(),
-            context: ConversationContext {
-                messages: vec![],
-                metadata: HashMap::new(),
-            },
-            auth: AuthContext {
-                user_id: "user-ehs-001".to_string(),
-                tenant_id: "tenant-acme".to_string(),
-                roles: vec!["ehs_specialist".to_string(), "agent".to_string()],
-            },
-        };
-
-        // Execute the agent reasoning cycle
-        match agent.reason(&query).await {
-            Ok(action) => {
-                info!(iteration = idx + 1, "Agent reasoning completed");
-
-                // Execute tools
-                match agent.act(&action).await {
-                    Ok(observations) => {
-                        info!(
-                            observation_count = observations.len(),
-                            "Tool execution completed"
-                        );
-
-                        // Generate response
-                        match agent.respond(&observations).await {
-                            Ok(response) => {
-                                info!(
-                                    content_length = response.content.len(),
-                                    suggested_actions = response.suggested_actions.len(),
-                                    "Agent response generated"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::error!("Response generation failed: {}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Tool execution failed: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!("Agent reasoning failed: {}", e);
-            }
-        }
-
-        info!("Query {} completed", idx + 1);
-    }
-
-    info!(
-        system_prompt_length = agent.system_prompt().len(),
-        max_iterations = agent.max_iterations(),
-        "EHS Permit Agent ready (demo mode - no gRPC server)"
-    );
+    axum::serve(listener, Router::new().route("/health", get(health)))
+        .with_graceful_shutdown(async { tokio::signal::ctrl_c().await.ok(); })
+        .await?;
 
     Ok(())
 }

@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use pekko_actor::{Actor, ActorContext};
 use pekko_agent_core::{
-    AgentInfo, AgentStatus, AgentTask, Message, MessageRole,
+    AgentInfo, AgentProfile, AgentStatus, AgentTask, Message, MessageRole,
     ShortTermMemory, ToolContext, ToolDefinition,
 };
 use pekko_agent_llm::{
@@ -72,7 +72,11 @@ pub struct QueryResult {
 
 pub enum OrchestratorMessage {
     // ── Existing lifecycle messages ──
-    RegisterAgent(AgentInfo),
+    RegisterAgent {
+        info:    AgentInfo,
+        /// Declares which tools this agent may use and optional token limit.
+        profile: AgentProfile,
+    },
     CreateWorkflow(Workflow),
     SubmitTask(AgentTask),
     AssignNextTask,
@@ -111,7 +115,7 @@ pub enum OrchestratorMessage {
 impl fmt::Debug for OrchestratorMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::RegisterAgent(a)     => write!(f, "RegisterAgent({})", a.agent_id),
+            Self::RegisterAgent { info, .. } => write!(f, "RegisterAgent({})", info.agent_id),
             Self::CreateWorkflow(w)    => write!(f, "CreateWorkflow({})", w.name),
             Self::SubmitTask(t)        => write!(f, "SubmitTask({})", t.task_id),
             Self::AssignNextTask       => write!(f, "AssignNextTask"),
@@ -132,6 +136,7 @@ impl fmt::Debug for OrchestratorMessage {
 pub struct OrchestratorActor {
     workflows:      HashMap<Uuid, Workflow>,
     agent_registry: HashMap<String, AgentInfo>,
+    agent_profiles: HashMap<String, AgentProfile>,
     task_queue:     VecDeque<AgentTask>,
     active_tasks:   HashMap<Uuid, TaskExecution>,
     #[allow(dead_code)]
@@ -177,8 +182,9 @@ impl Actor for OrchestratorActor {
         // For async messages, clone the deps (Arc clones are cheap) so the
         // returned future is 'static and Send.
         match msg {
-            OrchestratorMessage::RegisterAgent(agent) => {
-                self.register_agent(agent);
+            OrchestratorMessage::RegisterAgent { info, profile } => {
+                self.agent_profiles.insert(info.agent_id.clone(), profile);
+                self.register_agent(info);
                 Box::pin(async {})
             }
             OrchestratorMessage::CreateWorkflow(wf) => {
@@ -208,7 +214,7 @@ impl Actor for OrchestratorActor {
             OrchestratorMessage::QueryAgent {
                 agent_id, content, session_id, tenant_id, user_id, reply_to,
             } => {
-                // Clone Arc deps before the async block — future is Send + 'static
+                let profile = self.agent_profiles.get(&agent_id).cloned().unwrap_or_default();
                 let conv   = self.deps.conversation_store.clone();
                 let tools  = self.deps.tool_registry.clone();
                 let claude = self.deps.claude_client.clone();
@@ -217,11 +223,11 @@ impl Actor for OrchestratorActor {
                 let cfg    = self.deps.llm_config.clone();
                 let prov   = self.deps.llm_provider.clone();
 
-                // Spawn so actor is free immediately for next message
                 tokio::spawn(async move {
                     let result = run_query_loop(
                         agent_id, content, session_id, tenant_id, user_id,
                         conv, tools, claude, gemini, openai, cfg, prov,
+                        profile,
                     ).await;
                     let _ = reply_to.send(result);
                 });
@@ -231,6 +237,7 @@ impl Actor for OrchestratorActor {
             OrchestratorMessage::StreamAgent {
                 agent_id, content, session_id, tenant_id, user_id, event_tx,
             } => {
+                let profile = self.agent_profiles.get(&agent_id).cloned().unwrap_or_default();
                 let conv   = self.deps.conversation_store.clone();
                 let tools  = self.deps.tool_registry.clone();
                 let claude = self.deps.claude_client.clone();
@@ -239,12 +246,11 @@ impl Actor for OrchestratorActor {
                 let cfg    = self.deps.llm_config.clone();
                 let prov   = self.deps.llm_provider.clone();
 
-                // Spawn so actor is free immediately; event_tx drop closes SSE stream
                 tokio::spawn(async move {
                     run_stream_loop(
                         agent_id, content, session_id, tenant_id, user_id,
                         conv, tools, claude, gemini, openai, cfg, prov,
-                        event_tx,
+                        event_tx, profile,
                     ).await;
                 });
                 Box::pin(async {})
@@ -271,6 +277,7 @@ impl OrchestratorActor {
         Self {
             workflows:      HashMap::new(),
             agent_registry: HashMap::new(),
+            agent_profiles: HashMap::new(),
             task_queue:     VecDeque::new(),
             active_tasks:   HashMap::new(),
             saga_manager:   SagaManager::new(),
@@ -479,6 +486,7 @@ async fn run_query_loop(
     openai:     Option<Arc<OpenAIClient>>,
     cfg:        LlmConfig,
     provider:   String,
+    profile:    AgentProfile,
 ) -> Result<QueryResult, String> {
     // Persist user message
     let _ = conv.append_message(&session_id, Message::user(&content)).await;
@@ -493,9 +501,14 @@ async fn run_query_loop(
         content: vec![ContentBlock::Text { text: m.content.clone() }],
     }).collect();
 
-    let tool_defs = { tools.read().await.list_tools() };
-    let claude_tools = tool_definitions_to_claude_tools(&tool_defs);
+    let all_tool_defs = tools.read().await.list_tools();
+    let tool_defs: Vec<ToolDefinition> = match &profile.tool_whitelist {
+        Some(wl) => all_tool_defs.into_iter().filter(|t| wl.contains(&t.name)).collect(),
+        None     => all_tool_defs,
+    };
+    let claude_tools  = tool_definitions_to_claude_tools(&tool_defs);
     let system_prompt = build_system_prompt(&agent_id);
+    let max_tokens    = profile.max_tokens_override.unwrap_or(cfg.max_tokens);
 
     let mut all_tools_used: Vec<String> = Vec::new();
     let mut total_input:  u32 = 0;
@@ -507,7 +520,7 @@ async fn run_query_loop(
             system_prompt: system_prompt.clone(),
             messages: messages.clone(),
             tools: claude_tools.clone(),
-            max_tokens: cfg.max_tokens,
+            max_tokens,
             temperature: Some(cfg.temperature),
             cacheable: false,
         };
@@ -632,6 +645,7 @@ async fn run_stream_loop(
     cfg:        LlmConfig,
     provider:   String,
     tx:         mpsc::Sender<String>,
+    profile:    AgentProfile,
 ) {
     let _ = conv.append_message(&session_id, Message::user(&content)).await;
 
@@ -644,9 +658,14 @@ async fn run_stream_loop(
         content: vec![ContentBlock::Text { text: m.content.clone() }],
     }).collect();
 
-    let tool_defs = { tools.read().await.list_tools() };
-    let claude_tools = tool_definitions_to_claude_tools(&tool_defs);
+    let all_tool_defs = tools.read().await.list_tools();
+    let tool_defs: Vec<ToolDefinition> = match &profile.tool_whitelist {
+        Some(wl) => all_tool_defs.into_iter().filter(|t| wl.contains(&t.name)).collect(),
+        None     => all_tool_defs,
+    };
+    let claude_tools  = tool_definitions_to_claude_tools(&tool_defs);
     let system_prompt = build_system_prompt(&agent_id);
+    let max_tokens    = profile.max_tokens_override.unwrap_or(cfg.max_tokens);
 
     let mut all_tools_used: Vec<String> = Vec::new();
     let mut total_input:  u32 = 0;
@@ -660,7 +679,7 @@ async fn run_stream_loop(
             system_prompt: system_prompt.clone(),
             messages: messages.clone(),
             tools: claude_tools.clone(),
-            max_tokens: cfg.max_tokens,
+            max_tokens,
             temperature: Some(cfg.temperature),
             cacheable: false,
         };

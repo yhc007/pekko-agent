@@ -21,7 +21,7 @@ use uuid::Uuid;
 use tracing::{info, warn, error};
 
 use pekko_actor::ActorRef;
-use pekko_agent_core::{TokenUsage, ShortTermMemory, AgentInfo, AgentStatus};
+use pekko_agent_core::{TokenUsage, ShortTermMemory, AgentInfo, AgentProfile, AgentStatus};
 use pekko_agent_llm::{LlmConfig, ClaudeClient, GeminiClient, OpenAIClient};
 use pekko_agent_tools::{ToolRegistry, builtin::{PermitSearchTool, ComplianceCheckTool, EhsQueryTool}};
 use pekko_agent_memory::PgConversationStore;
@@ -517,6 +517,41 @@ async fn list_tools(
     Ok(Json(registry.list_tools()))
 }
 
+// ── Agent registration endpoint ───────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AgentRegistrationRequest {
+    info:    AgentInfo,
+    profile: AgentProfile,
+}
+
+/// POST /api/agents/register  — requires admin role
+///
+/// Called by EHS microservices at startup to register their AgentInfo
+/// and declare their tool whitelist / token limits.
+async fn register_agent(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+    Json(req):    Json<AgentRegistrationRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin.all").await?;
+
+    info!(
+        agent_id = %req.info.agent_id,
+        tool_whitelist = ?req.profile.tool_whitelist,
+        "Agent self-registration"
+    );
+
+    state.orchestrator_ref
+        .tell(OrchestratorMessage::RegisterAgent {
+            info:    req.info,
+            profile: req.profile,
+        })
+        .map_err(|_| service_unavailable("Orchestrator actor unavailable"))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -651,8 +686,10 @@ async fn main() -> anyhow::Result<()> {
     ];
 
     for agent in &agents {
-        orchestrator_ref.tell(OrchestratorMessage::RegisterAgent(agent.clone()))
-            .expect("Failed to send RegisterAgent");
+        orchestrator_ref.tell(OrchestratorMessage::RegisterAgent {
+            info:    agent.clone(),
+            profile: AgentProfile::default(), // EHS services override this at startup
+        }).expect("Failed to send RegisterAgent");
     }
     info!(agents = agents.len(), "OrchestratorActor spawned in ActorSystem");
 
@@ -685,6 +722,7 @@ async fn main() -> anyhow::Result<()> {
 
     let blocking_protected = Router::new()
         .route("/api/agents",                        get(list_agents))
+        .route("/api/agents/register",               post(register_agent))
         .route("/api/agents/:agent_id/query",        post(query_agent))
         .route("/api/sessions/:session_id/history",  get(get_session_history))
         .route("/api/tools",                         get(list_tools))

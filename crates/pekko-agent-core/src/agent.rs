@@ -61,7 +61,7 @@ pub trait AgentActor: Actor<Message = AgentMessage> + Send + Sync {
     fn transition(&mut self, new_state: AgentState);
 }
 
-// ─── AgentInfo & AgentStatus ────────────────────────────────────────────────
+// ─── AgentInfo, AgentProfile & AgentStatus ───────────────────────────────────
 
 /// Metadata exposed to the orchestrator / receptionist.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -71,6 +71,16 @@ pub struct AgentInfo {
     pub description: String,
     pub capabilities: Vec<String>,
     pub status: AgentStatus,
+}
+
+/// Per-agent execution profile.  Registered alongside `AgentInfo`.
+/// Allows each agent service to declare its own tool scope and limits.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AgentProfile {
+    /// Only these tools are visible to the agent. `None` means all tools.
+    pub tool_whitelist: Option<Vec<String>>,
+    /// Override the global `max_tokens` for this agent. `None` = use global.
+    pub max_tokens_override: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
