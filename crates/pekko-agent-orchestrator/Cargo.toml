@@ -19,3 +19,8 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 pekko-actor.workspace = true
 pekko-persistence.workspace = true
+pekko-agent-llm   = { path = "../pekko-agent-llm" }
+pekko-agent-tools = { path = "../pekko-agent-tools" }
+pekko-agent-memory = { path = "../pekko-agent-memory" }
+sqlx.workspace = true
+futures.workspace = true
