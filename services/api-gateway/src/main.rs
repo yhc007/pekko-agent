@@ -36,7 +36,7 @@ use pekko_agent_orchestrator::{
     Workflow, WorkflowResult,
 };
 use pekko_agent_orchestrator::saga::{SagaDefinition, SagaResult};
-use pekko_agent_events::EventPublisher;
+use pekko_agent_events::{AgentEventEnvelope, EventPublisher, event_types};
 use pekko_agent_security::{
     AuditLogger, AuditEntry, AuditOutcome, Claims, JwtError, JwtManager, RbacManager,
     RateLimiter, RateLimitConfig,
@@ -231,6 +231,14 @@ fn forbidden(msg: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
     make_error(StatusCode::FORBIDDEN, "FORBIDDEN", msg)
 }
 
+// ── Event helpers ─────────────────────────────────────────────────────────────
+
+/// Fire-and-forget event publish (never blocks the request handler).
+fn fire_event(pub_ref: &Arc<EventPublisher>, event: AgentEventEnvelope) {
+    let p = pub_ref.clone();
+    tokio::spawn(async move { let _ = p.publish(event).await; });
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 // ── Rate limit middleware ─────────────────────────────────────────────────────
@@ -317,6 +325,8 @@ fn path_label(path: &str) -> &'static str {
             "/api/sagas/definitions"          => "/api/sagas/definitions",
             "/api/agents/collaborate"         => "/api/agents/collaborate",
             "/api/agents/collaborate/stream"  => "/api/agents/collaborate/stream",
+            "/api/events/stream"              => "/api/events/stream",
+            "/api/events/history"             => "/api/events/history",
             "/metrics"                        => "/metrics",
             _                           => "other",
         }
@@ -445,14 +455,10 @@ async fn query_agent(
         "Agent query → OrchestratorActor"
     );
 
-    let event = pekko_agent_events::AgentEventEnvelope::new(
-        "api-gateway",
-        pekko_agent_events::event_types::TASK_ASSIGNED,
-        &tenant_id,
-        session_id,
-        serde_json::json!({ "agent_id": agent_id, "content": req.content, "user_id": user_id }),
-    );
-    let _ = state.event_publisher.publish(event).await;
+    fire_event(&state.event_publisher, AgentEventEnvelope::new(
+        "api-gateway", event_types::AGENT_QUERY_STARTED, &tenant_id, session_id,
+        serde_json::json!({ "agent_id": agent_id, "user_id": user_id }),
+    ));
 
     state.audit_logger.log(AuditEntry {
         id:        Uuid::new_v4(),
@@ -471,26 +477,45 @@ async fn query_agent(
             agent_id:   agent_id.clone(),
             content:    req.content,
             session_id,
-            tenant_id,
-            user_id,
+            tenant_id:  tenant_id.clone(),
+            user_id:    user_id.clone(),
             reply_to:   reply_tx,
         })
         .map_err(|_| service_unavailable("Orchestrator actor unavailable"))?;
 
     let result = reply_rx.await
-        .map_err(|_| internal_error("Orchestrator did not reply"))?
-        .map_err(|e| internal_error(format!("Query failed: {e}")))?;
+        .map_err(|_| internal_error("Orchestrator did not reply"))?;
 
-    Ok(Json(QueryResponse {
-        session_id:  result.session_id,
-        agent_id:    result.agent_id,
-        response:    result.response,
-        tools_used:  result.tools_used,
-        token_usage: TokenUsage {
-            input_tokens:  result.input_tokens,
-            output_tokens: result.output_tokens,
-        },
-    }))
+    match result {
+        Ok(r) => {
+            fire_event(&state.event_publisher, AgentEventEnvelope::new(
+                "api-gateway", event_types::AGENT_QUERY_COMPLETED, &tenant_id, session_id,
+                serde_json::json!({
+                    "agent_id":      r.agent_id,
+                    "tools_used":    r.tools_used,
+                    "input_tokens":  r.input_tokens,
+                    "output_tokens": r.output_tokens,
+                }),
+            ));
+            Ok(Json(QueryResponse {
+                session_id:  r.session_id,
+                agent_id:    r.agent_id,
+                response:    r.response,
+                tools_used:  r.tools_used,
+                token_usage: TokenUsage {
+                    input_tokens:  r.input_tokens,
+                    output_tokens: r.output_tokens,
+                },
+            }))
+        }
+        Err(e) => {
+            fire_event(&state.event_publisher, AgentEventEnvelope::new(
+                "api-gateway", event_types::AGENT_QUERY_FAILED, &tenant_id, session_id,
+                serde_json::json!({ "agent_id": agent_id, "error": e }),
+            ));
+            Err(internal_error(format!("Query failed: {e}")))
+        }
+    }
 }
 
 /// POST /api/agents/:agent_id/query/stream  — requires agent.delegate, SSE
@@ -771,6 +796,15 @@ async fn execute_workflow(
         "ExecuteWorkflow → OrchestratorActor"
     );
 
+    let workflow_id  = workflow.id;
+    let workflow_name = workflow.name.clone();
+    let tenant_id     = auth.0.tenant_id.clone();
+
+    fire_event(&state.event_publisher, AgentEventEnvelope::new(
+        "api-gateway", event_types::WORKFLOW_STARTED, &tenant_id, workflow_id,
+        serde_json::json!({ "name": workflow_name, "steps": workflow.steps.len() }),
+    ));
+
     let (reply_tx, reply_rx) = oneshot::channel();
     state.orchestrator_ref
         .tell(OrchestratorMessage::ExecuteWorkflow {
@@ -782,6 +816,20 @@ async fn execute_workflow(
     let result = reply_rx.await
         .map_err(|_| internal_error("Orchestrator did not reply"))?
         .map_err(|e| internal_error(format!("Workflow failed: {e}")))?;
+
+    let evt_type = match &result.status {
+        pekko_agent_orchestrator::WorkflowStatus::Completed => event_types::WORKFLOW_COMPLETED,
+        pekko_agent_orchestrator::WorkflowStatus::Compensated => event_types::WORKFLOW_COMPENSATED,
+        _ => event_types::WORKFLOW_FAILED,
+    };
+    fire_event(&state.event_publisher, AgentEventEnvelope::new(
+        "api-gateway", evt_type, &tenant_id, workflow_id,
+        serde_json::json!({
+            "name":            workflow_name,
+            "completed_steps": result.completed_steps.len(),
+            "failed_step":     result.failed_step,
+        }),
+    ));
 
     Ok(Json(result))
 }
@@ -871,14 +919,20 @@ async fn collaborate_agents(
     require_permission(&state, &auth.0, "agent.delegate").await?;
 
     let session_id = req.session_id.unwrap_or_else(Uuid::new_v4);
+    let tenant_id  = auth.0.tenant_id.clone();
     let (reply_tx, reply_rx) = oneshot::channel();
+
+    fire_event(&state.event_publisher, AgentEventEnvelope::new(
+        "api-gateway", event_types::COLLABORATION_STARTED, &tenant_id, session_id,
+        serde_json::json!({ "session_id": session_id, "agent_ids": req.agent_ids }),
+    ));
 
     state.orchestrator_ref
         .tell(OrchestratorMessage::CollaborateAgents {
             content:    req.content,
             agent_ids:  req.agent_ids,
             session_id,
-            tenant_id:  auth.0.tenant_id.clone(),
+            tenant_id:  tenant_id.clone(),
             user_id:    auth.0.sub.clone(),
             reply_to:   reply_tx,
         })
@@ -887,6 +941,16 @@ async fn collaborate_agents(
     let result = reply_rx.await
         .map_err(|_| internal_error("Orchestrator did not reply"))?
         .map_err(|e| internal_error(&e))?;
+
+    fire_event(&state.event_publisher, AgentEventEnvelope::new(
+        "api-gateway", event_types::COLLABORATION_COMPLETED, &tenant_id, session_id,
+        serde_json::json!({
+            "session_id":        session_id,
+            "agent_count":       result.agent_responses.len(),
+            "total_in_tokens":   result.total_in_tokens,
+            "total_out_tokens":  result.total_out_tokens,
+        }),
+    ));
 
     Ok(Json(result).into_response())
 }
@@ -969,6 +1033,14 @@ async fn execute_saga(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     require_permission(&state, &auth.0, "agent.delegate").await?;
 
+    let tenant_id   = auth.0.tenant_id.clone();
+    let exec_corr   = Uuid::new_v4();
+
+    fire_event(&state.event_publisher, AgentEventEnvelope::new(
+        "api-gateway", event_types::SAGA_STARTED, &tenant_id, exec_corr,
+        serde_json::json!({ "saga_id": saga_id }),
+    ));
+
     let (reply_tx, reply_rx) = oneshot::channel();
     state.orchestrator_ref
         .tell(OrchestratorMessage::ExecuteSaga {
@@ -980,6 +1052,24 @@ async fn execute_saga(
     let result = reply_rx.await
         .map_err(|_| internal_error("Orchestrator did not reply"))?
         .map_err(|e| internal_error(&e))?;
+
+    use pekko_agent_orchestrator::saga::SagaStatus;
+    let evt_type = match &result.status {
+        SagaStatus::Completed              => event_types::SAGA_COMPLETED,
+        SagaStatus::CompensationCompleted  => event_types::SAGA_COMPENSATED,
+        SagaStatus::CompensationFailed {..} => event_types::SAGA_COMPENSATION_FAILED,
+        _                                  => event_types::SAGA_COMPLETED,
+    };
+    fire_event(&state.event_publisher, AgentEventEnvelope::new(
+        "api-gateway", evt_type, &tenant_id, result.execution_id,
+        serde_json::json!({
+            "saga_id":      result.saga_id,
+            "execution_id": result.execution_id,
+            "name":         result.name,
+            "failed_step":  result.failed_step,
+            "error":        result.error,
+        }),
+    ));
 
     Ok(Json(result).into_response())
 }
@@ -1031,6 +1121,63 @@ async fn get_saga_execution(
         None    => Err(make_error(StatusCode::NOT_FOUND, "NOT_FOUND",
             format!("Saga execution {exec_id} not found"))),
     }
+}
+
+// ── Event endpoints ───────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct EventHistoryQuery {
+    #[serde(default = "default_event_limit")]
+    limit:  usize,
+    tenant: Option<String>,
+}
+fn default_event_limit() -> usize { 50 }
+
+/// GET /api/events/stream  — real-time SSE event stream for all tenant events
+async fn stream_events(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "memory.read").await?;
+
+    let tenant_id = auth.0.tenant_id.clone();
+    let rx        = state.event_publisher.subscribe();
+
+    let stream = stream::unfold(
+        (rx, tenant_id),
+        |(mut rx, tenant_id)| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(env) => {
+                        if env.tenant_id != tenant_id { continue; }
+                        let data = serde_json::to_string(&env).unwrap_or_default();
+                        return Some((
+                            Ok::<Event, Infallible>(Event::default().data(data)),
+                            (rx, tenant_id),
+                        ));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed)    => return None,
+                }
+            }
+        },
+    );
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
+}
+
+/// GET /api/events/history  — recent event history (ring buffer)
+async fn event_history(
+    auth:                    AuthUser,
+    State(state):            State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<EventHistoryQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "memory.read").await?;
+
+    let tenant_id = q.tenant.as_deref().unwrap_or(&auth.0.tenant_id);
+    let events    = state.event_publisher.recent_events_for_tenant(tenant_id, q.limit).await;
+
+    Ok(Json(events).into_response())
 }
 
 // ── Agent registration endpoint ───────────────────────────────────────────────
@@ -1362,6 +1509,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/sagas/executions/:exec_id",     get(get_saga_execution))
         // ── Multi-agent collaboration ──
         .route("/api/agents/collaborate",            post(collaborate_agents))
+        // ── Event history ──
+        .route("/api/events/history",                get(event_history))
         .layer(TimeoutLayer::new(BLOCKING_TIMEOUT));
 
     let streaming_protected = Router::new()
@@ -1369,7 +1518,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/agents/:agent_id/ws",           get(ws_agent))
         .route("/api/workflows/stream",              post(stream_workflow))
         .route("/api/sagas/:saga_id/stream",         post(stream_saga))
-        .route("/api/agents/collaborate/stream",     post(stream_collaborate_agents));
+        .route("/api/agents/collaborate/stream",     post(stream_collaborate_agents))
+        .route("/api/events/stream",                 get(stream_events));
 
     let port: u16 = std::env::var("API_GATEWAY_PORT")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(8080);
