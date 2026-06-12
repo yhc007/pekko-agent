@@ -68,3 +68,92 @@ impl AuditLogger {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(tenant: &str, agent: &str, action: &str) -> AuditEntry {
+        AuditEntry {
+            id:        Uuid::new_v4(),
+            timestamp: Utc::now(),
+            tenant_id: tenant.into(),
+            agent_id:  agent.into(),
+            action:    action.into(),
+            resource:  "/api/test".into(),
+            outcome:   AuditOutcome::Success,
+            details:   serde_json::Value::Null,
+        }
+    }
+
+    #[tokio::test]
+    async fn log_and_query_all_entries() {
+        let logger = AuditLogger::new(100);
+        logger.log(entry("t1", "agent-a", "query")).await;
+        logger.log(entry("t1", "agent-b", "workflow")).await;
+
+        let all = logger.query(None, None, 10).await;
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn query_filter_by_tenant() {
+        let logger = AuditLogger::new(100);
+        logger.log(entry("t1", "a", "q1")).await;
+        logger.log(entry("t2", "b", "q2")).await;
+        logger.log(entry("t1", "c", "q3")).await;
+
+        let t1 = logger.query(Some("t1"), None, 10).await;
+        assert_eq!(t1.len(), 2);
+
+        let t2 = logger.query(Some("t2"), None, 10).await;
+        assert_eq!(t2.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_filter_by_agent() {
+        let logger = AuditLogger::new(100);
+        logger.log(entry("t1", "agent-a", "q")).await;
+        logger.log(entry("t1", "agent-b", "q")).await;
+        logger.log(entry("t1", "agent-a", "q2")).await;
+
+        let by_agent = logger.query(None, Some("agent-a"), 10).await;
+        assert_eq!(by_agent.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn ring_buffer_evicts_oldest_when_full() {
+        let logger = AuditLogger::new(3);
+        for i in 0..5u32 {
+            logger.log(entry("t", "a", &format!("action-{i}"))).await;
+        }
+        let entries = logger.query(None, None, 10).await;
+        assert_eq!(entries.len(), 3);
+        // most-recent-first from query (reversed)
+        assert!(entries[0].action.starts_with("action-4"));
+    }
+
+    #[tokio::test]
+    async fn query_respects_limit() {
+        let logger = AuditLogger::new(100);
+        for i in 0..10u32 {
+            logger.log(entry("t1", "a", &format!("a{i}"))).await;
+        }
+        let limited = logger.query(None, None, 3).await;
+        assert_eq!(limited.len(), 3);
+    }
+
+    #[test]
+    fn audit_outcome_serializes() {
+        let outcomes = vec![
+            AuditOutcome::Success,
+            AuditOutcome::Failure("db error".into()),
+            AuditOutcome::Denied("no permission".into()),
+        ];
+        for o in outcomes {
+            let json = serde_json::to_string(&o).unwrap();
+            let rt: AuditOutcome = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{o:?}"), format!("{rt:?}"));
+        }
+    }
+}

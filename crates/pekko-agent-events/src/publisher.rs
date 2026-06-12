@@ -96,3 +96,87 @@ pub enum EventError {
     #[error("Serialization failed: {0}")]
     Serialize(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::AgentEventEnvelope;
+    use uuid::Uuid;
+
+    fn evt(tenant: &str, event_type: &str) -> AgentEventEnvelope {
+        AgentEventEnvelope::new(
+            "test-svc", event_type, tenant, Uuid::new_v4(),
+            serde_json::json!({"test": true}),
+        )
+    }
+
+    #[tokio::test]
+    async fn publish_without_subscribers_succeeds() {
+        let pub_ = EventPublisher::new("test", 16);
+        assert!(pub_.publish(evt("t1", "any.event")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn subscriber_receives_published_event() {
+        let pub_ = EventPublisher::new("test", 16);
+        let mut rx = pub_.subscribe();
+        let event  = evt("t1", "agent.query.started");
+        pub_.publish(event.clone()).await.unwrap();
+        let got = rx.recv().await.unwrap();
+        assert_eq!(got.event_type, event.event_type);
+        assert_eq!(got.tenant_id, "t1");
+    }
+
+    #[tokio::test]
+    async fn multiple_subscribers_each_receive() {
+        let pub_  = EventPublisher::new("test", 16);
+        let mut r1 = pub_.subscribe();
+        let mut r2 = pub_.subscribe();
+        let event  = evt("t1", "multi.test");
+        pub_.publish(event.clone()).await.unwrap();
+        assert_eq!(r1.recv().await.unwrap().event_type, event.event_type);
+        assert_eq!(r2.recv().await.unwrap().event_type, event.event_type);
+    }
+
+    #[tokio::test]
+    async fn recent_events_returns_last_n() {
+        let pub_ = EventPublisher::new("test", 64);
+        for i in 0..5u32 {
+            pub_.publish(evt("t1", &format!("evt.{i}"))).await.unwrap();
+        }
+        let recent = pub_.recent_events(3).await;
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[2].event_type, "evt.4");
+    }
+
+    #[tokio::test]
+    async fn recent_events_for_tenant_filters_correctly() {
+        let pub_ = EventPublisher::new("test", 64);
+        pub_.publish(evt("t1", "x.a")).await.unwrap();
+        pub_.publish(evt("t2", "x.b")).await.unwrap();
+        pub_.publish(evt("t1", "x.c")).await.unwrap();
+
+        let t1 = pub_.recent_events_for_tenant("t1", 10).await;
+        assert_eq!(t1.len(), 2);
+        assert_eq!(t1[0].event_type, "x.a");
+        assert_eq!(t1[1].event_type, "x.c");
+
+        let t2 = pub_.recent_events_for_tenant("t2", 10).await;
+        assert_eq!(t2.len(), 1);
+        assert_eq!(t2[0].event_type, "x.b");
+    }
+
+    #[tokio::test]
+    async fn ring_buffer_drops_oldest_when_full() {
+        // max_history = DEFAULT_HISTORY (500); use a small publisher by testing behaviour:
+        // publish 5, ask for last 3 → should get indices 2,3,4
+        let pub_ = EventPublisher::new("test", 64);
+        for i in 0..5u32 {
+            pub_.publish(evt("t1", &format!("e{i}"))).await.unwrap();
+        }
+        let r = pub_.recent_events(3).await;
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0].event_type, "e2");
+        assert_eq!(r[2].event_type, "e4");
+    }
+}

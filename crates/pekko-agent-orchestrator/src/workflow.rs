@@ -272,3 +272,95 @@ pub fn build_workflow_fsm(
             .end_state()
         .build()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_step(id: &str) -> WorkflowStep {
+        WorkflowStep {
+            step_id:           id.into(),
+            agent_type:        "ehs".into(),
+            action:            "do something".into(),
+            input_mapping:     HashMap::new(),
+            output_key:        "result".into(),
+            depends_on:        vec![],
+            timeout_ms:        5_000,
+            compensation_action: None,
+        }
+    }
+
+    #[test]
+    fn new_workflow_starts_in_created_status() {
+        let wf = Workflow::new("permit-flow", "EHS permit workflow");
+        assert_eq!(wf.status, WorkflowStatus::Created);
+        assert_eq!(wf.name, "permit-flow");
+        assert!(wf.steps.is_empty());
+    }
+
+    #[test]
+    fn add_step_appends_to_steps_vec() {
+        let mut wf = Workflow::new("w", "d");
+        wf.add_step(make_step("s1"));
+        wf.add_step(make_step("s2"));
+        assert_eq!(wf.steps.len(), 2);
+        assert_eq!(wf.steps[0].step_id, "s1");
+    }
+
+    #[test]
+    fn workflow_status_all_variants_serialize_round_trip() {
+        use WorkflowStatus::*;
+        let variants: Vec<WorkflowStatus> = vec![
+            Created,
+            Running { current_step: 3 },
+            Paused  { at_step: 1 },
+            Completed,
+            Failed  { at_step: 2, error: "timeout".into() },
+            Cancelled,
+            Compensating { failed_at: 2, compensating_step: 1 },
+            Compensated,
+            CompensationFailed { error: "db down".into() },
+        ];
+        for v in variants {
+            let json = serde_json::to_string(&v).expect("serialize");
+            let rt: WorkflowStatus = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(v, rt);
+        }
+    }
+
+    #[test]
+    fn workflow_step_compensation_action_optional_defaults_none() {
+        let json = r#"{
+            "step_id":       "s1",
+            "agent_type":    "ehs",
+            "action":        "check",
+            "input_mapping": {},
+            "output_key":    "r",
+            "depends_on":    [],
+            "timeout_ms":    1000
+        }"#;
+        let step: WorkflowStep = serde_json::from_str(json).unwrap();
+        assert!(step.compensation_action.is_none());
+    }
+
+    #[test]
+    fn workflow_step_with_compensation_serializes() {
+        let mut step = make_step("s1");
+        step.compensation_action = Some("undo permit request".into());
+        let json = serde_json::to_string(&step).unwrap();
+        let rt: WorkflowStep = serde_json::from_str(&json).unwrap();
+        assert_eq!(rt.compensation_action.as_deref(), Some("undo permit request"));
+    }
+
+    #[test]
+    fn workflow_serializes_round_trip() {
+        let mut wf = Workflow::new("flow", "desc");
+        wf.add_step(make_step("step-1"));
+        wf.status = WorkflowStatus::Running { current_step: 0 };
+        let json = serde_json::to_string(&wf).unwrap();
+        let rt: Workflow = serde_json::from_str(&json).unwrap();
+        assert_eq!(rt.id, wf.id);
+        assert_eq!(rt.name, "flow");
+        assert_eq!(rt.steps.len(), 1);
+    }
+}

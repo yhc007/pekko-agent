@@ -106,3 +106,87 @@ impl RateLimiter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rl(default_rpm: u32) -> RateLimiter {
+        RateLimiter::new(RateLimitConfig {
+            admin_rpm:   1000,
+            agent_rpm:   100,
+            default_rpm,
+        })
+    }
+
+    #[test]
+    fn allows_requests_within_limit() {
+        let limiter = rl(10);
+        let roles   = vec!["agent".to_string()];
+        for _ in 0..5 {
+            assert!(limiter.check("tenant-a", &roles).is_ok());
+        }
+    }
+
+    #[test]
+    fn rejects_after_limit_exceeded() {
+        let limiter = rl(3);
+        let roles: Vec<String> = vec![];
+        for _ in 0..3 {
+            assert!(limiter.check("tenant-x", &roles).is_ok());
+        }
+        let err = limiter.check("tenant-x", &roles).unwrap_err();
+        assert_eq!(err.limit, 3);
+        assert!(err.retry_after_secs >= 1);
+    }
+
+    #[test]
+    fn admin_gets_higher_limit_than_default() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            admin_rpm:   5,
+            agent_rpm:   2,
+            default_rpm: 1,
+        });
+
+        let admin_roles = vec!["admin".to_string()];
+        for _ in 0..5 {
+            assert!(limiter.check("admin-tenant", &admin_roles).is_ok());
+        }
+        assert!(limiter.check("admin-tenant", &admin_roles).is_err());
+    }
+
+    #[test]
+    fn different_tenants_are_independent() {
+        let limiter = rl(2);
+        let roles: Vec<String> = vec![];
+
+        limiter.check("tenant-a", &roles).unwrap();
+        limiter.check("tenant-a", &roles).unwrap();
+        assert!(limiter.check("tenant-a", &roles).is_err());
+
+        // tenant-b is independent — should still be allowed
+        assert!(limiter.check("tenant-b", &roles).is_ok());
+    }
+
+    #[test]
+    fn current_count_tracks_requests() {
+        let limiter = rl(100);
+        assert_eq!(limiter.current_count("new-tenant"), 0);
+
+        let roles = vec!["agent".to_string()];
+        limiter.check("my-tenant", &roles).unwrap();
+        limiter.check("my-tenant", &roles).unwrap();
+        assert_eq!(limiter.current_count("my-tenant"), 2);
+    }
+
+    #[test]
+    fn rate_limit_error_message_contains_tenant_and_limit() {
+        let limiter = rl(1);
+        let roles: Vec<String> = vec![];
+        limiter.check("t1", &roles).unwrap();
+        let err = limiter.check("t1", &roles).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("t1"));
+        assert!(msg.contains('1'));
+    }
+}

@@ -68,3 +68,70 @@ impl EventConsumer {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::publisher::EventPublisher;
+    use crate::schema::AgentEventEnvelope;
+    use uuid::Uuid;
+
+    fn evt(event_type: &str) -> AgentEventEnvelope {
+        AgentEventEnvelope::new("test", event_type, "t1", Uuid::new_v4(), serde_json::Value::Null)
+    }
+
+    #[tokio::test]
+    async fn consume_one_without_filter() {
+        let pub_ = EventPublisher::new("test", 16);
+        let mut consumer = EventConsumer::new(pub_.subscribe());
+        pub_.publish(evt("some.event")).await.unwrap();
+        let got = consumer.consume_one().await.unwrap();
+        assert_eq!(got.event_type, "some.event");
+    }
+
+    #[tokio::test]
+    async fn filter_skips_non_matching_prefix() {
+        let pub_  = EventPublisher::new("test", 16);
+        let mut consumer = EventConsumer::new(pub_.subscribe()).with_filter("workflow.");
+
+        // agent.* event should be skipped, workflow.* should pass
+        pub_.publish(evt("agent.query.started")).await.unwrap();
+        pub_.publish(evt("workflow.started")).await.unwrap();
+
+        let got = consumer.consume_one().await.unwrap();
+        assert_eq!(got.event_type, "workflow.started");
+    }
+
+    #[tokio::test]
+    async fn try_drain_empty_channel() {
+        let pub_  = EventPublisher::new("test", 16);
+        let mut consumer = EventConsumer::new(pub_.subscribe());
+        assert!(consumer.try_drain().is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_drain_returns_pending_events() {
+        let pub_  = EventPublisher::new("test", 16);
+        let mut consumer = EventConsumer::new(pub_.subscribe());
+        pub_.publish(evt("e.1")).await.unwrap();
+        pub_.publish(evt("e.2")).await.unwrap();
+        pub_.publish(evt("e.3")).await.unwrap();
+        // Brief yield so the broadcast channel delivers all three
+        tokio::task::yield_now().await;
+        let drained = consumer.try_drain();
+        assert_eq!(drained.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn try_drain_with_filter_skips_mismatched() {
+        let pub_  = EventPublisher::new("test", 16);
+        let mut consumer = EventConsumer::new(pub_.subscribe()).with_filter("saga.");
+        pub_.publish(evt("saga.started")).await.unwrap();
+        pub_.publish(evt("workflow.started")).await.unwrap();
+        pub_.publish(evt("saga.completed")).await.unwrap();
+        tokio::task::yield_now().await;
+        let drained = consumer.try_drain();
+        assert_eq!(drained.len(), 2);
+        assert!(drained.iter().all(|e| e.event_type.starts_with("saga.")));
+    }
+}

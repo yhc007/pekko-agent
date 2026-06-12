@@ -243,3 +243,22 @@ pub fn spawn_save_agent(
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workflow::WorkflowStatus;
+
+    #[test]
+    fn workflow_status_label_covers_all_variants() {
+        assert_eq!(workflow_status_label(&WorkflowStatus::Created), "created");
+        assert_eq!(workflow_status_label(&WorkflowStatus::Running { current_step: 0 }), "running");
+        assert_eq!(workflow_status_label(&WorkflowStatus::Paused  { at_step: 1 }),      "paused");
+        assert_eq!(workflow_status_label(&WorkflowStatus::Completed),                   "completed");
+        assert_eq!(workflow_status_label(&WorkflowStatus::Failed  { at_step: 0, error: "e".into() }), "failed");
+        assert_eq!(workflow_status_label(&WorkflowStatus::Cancelled),                   "cancelled");
+        assert_eq!(workflow_status_label(&WorkflowStatus::Compensating { failed_at: 0, compensating_step: 0 }), "compensating");
+        assert_eq!(workflow_status_label(&WorkflowStatus::Compensated),                 "compensated");
+        assert_eq!(workflow_status_label(&WorkflowStatus::CompensationFailed { error: "e".into() }), "compensation_failed");
+    }
+}

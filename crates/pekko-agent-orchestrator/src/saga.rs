@@ -358,3 +358,147 @@ pub async fn run_compensations(
 pub async fn emit_event(tx: &mpsc::Sender<String>, v: serde_json::Value) {
     let _ = tx.send(serde_json::to_string(&v).unwrap_or_default()).await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_saga() -> SagaDefinition {
+        SagaDefinition {
+            saga_id: Uuid::new_v4(),
+            name:    "ehs-permit-saga".into(),
+            steps:   vec![
+                SagaStep {
+                    step_name:            "validate-permit".into(),
+                    agent_type:           "ehs-permit-agent".into(),
+                    action:               "검토 및 유효성 확인".into(),
+                    compensation_action:  "검토 취소".into(),
+                    timeout_ms:           5_000,
+                },
+                SagaStep {
+                    step_name:            "issue-permit".into(),
+                    agent_type:           "ehs-permit-agent".into(),
+                    action:               "허가증 발급".into(),
+                    compensation_action:  "허가증 취소".into(),
+                    timeout_ms:           10_000,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn saga_manager_register_and_get() {
+        let mut mgr  = SagaManager::new();
+        let saga     = make_saga();
+        let id       = saga.saga_id;
+        mgr.register(saga);
+
+        assert!(mgr.get_definition(&id).is_some());
+        assert_eq!(mgr.all_definitions().len(), 1);
+    }
+
+    #[test]
+    fn saga_manager_get_unknown_returns_none() {
+        let mgr = SagaManager::new();
+        assert!(mgr.get_definition(&Uuid::new_v4()).is_none());
+    }
+
+    #[test]
+    fn saga_execution_insert_and_retrieve() {
+        let mut mgr  = SagaManager::new();
+        let saga     = make_saga();
+        let saga_id  = saga.saga_id;
+        mgr.register(saga.clone());
+
+        let exec_id  = Uuid::new_v4();
+        let exec     = SagaExecution {
+            execution_id:         exec_id,
+            saga:                 saga,
+            completed_steps:      vec![0],
+            compensation_results: vec![],
+            status:               SagaStatus::Running,
+        };
+        mgr.insert_execution(exec);
+
+        let got = mgr.get_execution(&exec_id).unwrap();
+        assert_eq!(got.execution_id, exec_id);
+        assert_eq!(got.saga.saga_id, saga_id);
+        assert_eq!(got.completed_steps, vec![0]);
+    }
+
+    #[test]
+    fn saga_execution_update_overwrites() {
+        let mut mgr  = SagaManager::new();
+        let saga     = make_saga();
+        mgr.register(saga.clone());
+
+        let exec_id  = Uuid::new_v4();
+        let exec     = SagaExecution {
+            execution_id:         exec_id,
+            saga:                 saga,
+            completed_steps:      vec![],
+            compensation_results: vec![],
+            status:               SagaStatus::Running,
+        };
+        mgr.insert_execution(exec.clone());
+
+        let mut updated = exec;
+        updated.status          = SagaStatus::Completed;
+        updated.completed_steps = vec![0, 1];
+        mgr.update_execution(updated);
+
+        let got = mgr.get_execution(&exec_id).unwrap();
+        assert_eq!(got.status, SagaStatus::Completed);
+        assert_eq!(got.completed_steps.len(), 2);
+    }
+
+    #[test]
+    fn saga_status_all_variants_serialize_round_trip() {
+        let variants = vec![
+            SagaStatus::Running,
+            SagaStatus::Completed,
+            SagaStatus::Compensating { failed_at: 1 },
+            SagaStatus::CompensationCompleted,
+            SagaStatus::CompensationFailed { error: "step timed out".into() },
+            SagaStatus::Failed { error: "agent unreachable".into() },
+        ];
+        for v in variants {
+            let json = serde_json::to_string(&v).expect("serialize");
+            let rt: SagaStatus = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(v, rt);
+        }
+    }
+
+    #[test]
+    fn saga_step_default_timeout_ms_from_json() {
+        let json = r#"{
+            "step_name":           "check",
+            "agent_type":          "ehs",
+            "action":              "do",
+            "compensation_action": "undo"
+        }"#;
+        let step: SagaStep = serde_json::from_str(json).unwrap();
+        assert_eq!(step.timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn saga_result_round_trip_serialization() {
+        let exec_id = Uuid::new_v4();
+        let saga_id = Uuid::new_v4();
+        let result  = SagaResult {
+            execution_id:         exec_id,
+            saga_id,
+            name:                 "permit-saga".into(),
+            status:               SagaStatus::Completed,
+            completed_steps:      vec![0, 1],
+            compensation_results: vec![],
+            failed_step:          None,
+            error:                None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let rt: SagaResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(rt.execution_id, exec_id);
+        assert_eq!(rt.name, "permit-saga");
+        assert!(rt.error.is_none());
+    }
+}

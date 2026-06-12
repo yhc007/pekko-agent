@@ -102,3 +102,96 @@ impl RbacManager {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_role_grants_all_permissions() {
+        let mut rbac = RbacManager::new();
+        rbac.assign_role("admin-user", "admin");
+
+        assert!(rbac.check_permission("admin-user", "memory.read"));
+        assert!(rbac.check_permission("admin-user", "agent.delegate"));
+        assert!(rbac.check_permission("admin-user", "admin.all"));
+        assert!(rbac.check_permission("admin-user", "any.unknown.permission"));
+    }
+
+    #[test]
+    fn agent_role_grants_correct_permissions() {
+        let mut rbac = RbacManager::new();
+        rbac.assign_role("my-agent", "agent");
+
+        assert!(rbac.check_permission("my-agent", "memory.read"));
+        assert!(rbac.check_permission("my-agent", "memory.write"));
+        assert!(rbac.check_permission("my-agent", "agent.delegate"));
+        assert!(!rbac.check_permission("my-agent", "admin.all"));
+        assert!(!rbac.check_permission("my-agent", "audit.access"));
+    }
+
+    #[test]
+    fn viewer_role_grants_read_and_audit_only() {
+        let mut rbac = RbacManager::new();
+        rbac.assign_role("reader", "viewer");
+
+        assert!(rbac.check_permission("reader", "memory.read"));
+        assert!(rbac.check_permission("reader", "audit.access"));
+        assert!(!rbac.check_permission("reader", "memory.write"));
+        assert!(!rbac.check_permission("reader", "agent.delegate"));
+    }
+
+    #[test]
+    fn unknown_agent_returns_false() {
+        let rbac = RbacManager::new();
+        assert!(!rbac.check_permission("no-such-agent", "memory.read"));
+    }
+
+    #[test]
+    fn check_user_permission_with_jwt_roles_vec() {
+        let rbac = RbacManager::new();
+
+        let admin_roles = vec!["admin".to_string()];
+        assert!(rbac.check_user_permission(&admin_roles, "memory.read"));
+        assert!(rbac.check_user_permission(&admin_roles, "any.permission"));
+
+        let agent_roles = vec!["agent".to_string()];
+        assert!(rbac.check_user_permission(&agent_roles, "agent.delegate"));
+        assert!(!rbac.check_user_permission(&agent_roles, "admin.all"));
+
+        let empty: Vec<String> = vec![];
+        assert!(!rbac.check_user_permission(&empty, "memory.read"));
+    }
+
+    #[test]
+    fn custom_ehs_operator_role() {
+        let mut rbac = RbacManager::new();
+        rbac.add_role("ehs-operator", vec![
+            Permission::ToolExecute("permit_search".into()),
+            Permission::MemoryRead,
+        ]);
+        rbac.assign_role("op-1", "ehs-operator");
+
+        assert!(rbac.check_permission("op-1", "memory.read"));
+        assert!(rbac.check_permission("op-1", "tool.permit_search"));
+        assert!(!rbac.check_permission("op-1", "agent.delegate"));
+        assert!(!rbac.check_permission("op-1", "tool.other_tool"));
+    }
+
+    #[test]
+    fn permission_tool_execute_matches_tool_string() {
+        let p = Permission::ToolExecute("permit_search".into());
+        assert!(p.matches("tool.permit_search"));
+        assert!(!p.matches("tool.compliance_check"));
+        assert!(!p.matches("memory.read"));
+    }
+
+    #[test]
+    fn get_agent_permissions_returns_correct_list() {
+        let mut rbac = RbacManager::new();
+        rbac.assign_role("agent-x", "agent");
+        let perms = rbac.get_agent_permissions("agent-x");
+        // agent role: MemoryRead, MemoryWrite, AgentDelegate
+        assert_eq!(perms.len(), 3);
+    }
+}
