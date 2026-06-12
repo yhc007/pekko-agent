@@ -32,6 +32,7 @@ use pekko_agent_observability::{MetricsRegistry, TracerProvider};
 use pekko_agent_orchestrator::{
     OrchestratorActor, OrchestratorDeps, OrchestratorMessage,
     OrchestratorPersistence,
+    CollaborationResult,
     Workflow, WorkflowResult,
 };
 use pekko_agent_orchestrator::saga::{SagaDefinition, SagaResult};
@@ -313,8 +314,10 @@ fn path_label(path: &str) -> &'static str {
             "/api/workflows/stream"     => "/api/workflows/stream",
             "/api/memory/store"         => "/api/memory/store",
             "/api/memory/search"        => "/api/memory/search",
-            "/api/sagas/definitions"    => "/api/sagas/definitions",
-            "/metrics"                  => "/metrics",
+            "/api/sagas/definitions"          => "/api/sagas/definitions",
+            "/api/agents/collaborate"         => "/api/agents/collaborate",
+            "/api/agents/collaborate/stream"  => "/api/agents/collaborate/stream",
+            "/metrics"                        => "/metrics",
             _                           => "other",
         }
     }
@@ -846,6 +849,79 @@ async fn get_workflow_status(
     }
 }
 
+// ── Multi-agent collaboration endpoints ───────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CollaborateRequest {
+    content:    String,
+    /// Explicit list of agent IDs to involve. Omit to use all registered agents.
+    agent_ids:  Option<Vec<String>>,
+    session_id: Option<Uuid>,
+}
+
+/// POST /api/agents/collaborate  — requires agent.delegate
+///
+/// Fans out the query to multiple agents in parallel, then synthesises
+/// their responses into a single coherent answer.
+async fn collaborate_agents(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+    Json(req):    Json<CollaborateRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "agent.delegate").await?;
+
+    let session_id = req.session_id.unwrap_or_else(Uuid::new_v4);
+    let (reply_tx, reply_rx) = oneshot::channel();
+
+    state.orchestrator_ref
+        .tell(OrchestratorMessage::CollaborateAgents {
+            content:    req.content,
+            agent_ids:  req.agent_ids,
+            session_id,
+            tenant_id:  auth.0.tenant_id.clone(),
+            user_id:    auth.0.sub.clone(),
+            reply_to:   reply_tx,
+        })
+        .map_err(|_| service_unavailable("Orchestrator actor unavailable"))?;
+
+    let result = reply_rx.await
+        .map_err(|_| internal_error("Orchestrator did not reply"))?
+        .map_err(|e| internal_error(&e))?;
+
+    Ok(Json(result).into_response())
+}
+
+/// POST /api/agents/collaborate/stream  — SSE streaming multi-agent collaboration
+async fn stream_collaborate_agents(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+    Json(req):    Json<CollaborateRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "agent.delegate").await?;
+
+    let session_id = req.session_id.unwrap_or_else(Uuid::new_v4);
+    let (event_tx, mut event_rx) = mpsc::channel::<String>(512);
+
+    state.orchestrator_ref
+        .tell(OrchestratorMessage::StreamCollaborateAgents {
+            content:    req.content,
+            agent_ids:  req.agent_ids,
+            session_id,
+            tenant_id:  auth.0.tenant_id.clone(),
+            user_id:    auth.0.sub.clone(),
+            event_tx,
+        })
+        .map_err(|_| service_unavailable("Orchestrator actor unavailable"))?;
+
+    let stream = stream::unfold(event_rx, |mut rx| async move {
+        rx.recv().await.map(|data| {
+            (Ok::<Event, Infallible>(Event::default().data(data)), rx)
+        })
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
+}
+
 // ── Saga endpoints ────────────────────────────────────────────────────────────
 
 /// POST /api/sagas/definitions  — register a SagaDefinition; requires admin.all
@@ -1284,13 +1360,16 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/sagas/definitions",             post(register_saga).get(list_sagas))
         .route("/api/sagas/:saga_id/execute",        post(execute_saga))
         .route("/api/sagas/executions/:exec_id",     get(get_saga_execution))
+        // ── Multi-agent collaboration ──
+        .route("/api/agents/collaborate",            post(collaborate_agents))
         .layer(TimeoutLayer::new(BLOCKING_TIMEOUT));
 
     let streaming_protected = Router::new()
         .route("/api/agents/:agent_id/query/stream", post(stream_query_agent))
         .route("/api/agents/:agent_id/ws",           get(ws_agent))
         .route("/api/workflows/stream",              post(stream_workflow))
-        .route("/api/sagas/:saga_id/stream",         post(stream_saga));
+        .route("/api/sagas/:saga_id/stream",         post(stream_saga))
+        .route("/api/agents/collaborate/stream",     post(stream_collaborate_agents));
 
     let port: u16 = std::env::var("API_GATEWAY_PORT")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(8080);

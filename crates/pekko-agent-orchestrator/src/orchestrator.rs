@@ -66,7 +66,7 @@ pub struct OrchestratorDeps {
     pub persistence:        Option<Arc<OrchestratorPersistence>>,
 }
 
-// ─── Result type ─────────────────────────────────────────────────────────────
+// ─── Result types ─────────────────────────────────────────────────────────────
 
 /// The result returned by a `QueryAgent` message.
 #[derive(Debug)]
@@ -77,6 +77,29 @@ pub struct QueryResult {
     pub tools_used:    Vec<String>,
     pub input_tokens:  u32,
     pub output_tokens: u32,
+}
+
+/// A single agent's contribution to a collaboration.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentResponse {
+    pub agent_id:      String,
+    pub response:      String,
+    pub tools_used:    Vec<String>,
+    pub input_tokens:  u32,
+    pub output_tokens: u32,
+    pub error:         Option<String>,
+}
+
+/// Combined result from `CollaborateAgents`: per-agent responses + LLM synthesis.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CollaborationResult {
+    pub session_id:      Uuid,
+    pub query:           String,
+    pub agent_responses: Vec<AgentResponse>,
+    /// Final synthesised answer produced by the orchestrator LLM.
+    pub synthesis:       String,
+    pub total_in_tokens:  u32,
+    pub total_out_tokens: u32,
 }
 
 // ─── Messages ────────────────────────────────────────────────────────────────
@@ -169,6 +192,30 @@ pub enum OrchestratorMessage {
     ListSagas {
         reply_to: oneshot::Sender<Vec<SagaDefinition>>,
     },
+
+    // ── Multi-agent collaboration ──
+
+    /// Fan out a query to multiple agents in parallel, then synthesise results.
+    ///
+    /// If `agent_ids` is `None`, all registered agents are used.
+    CollaborateAgents {
+        content:    String,
+        agent_ids:  Option<Vec<String>>,
+        session_id: Uuid,
+        tenant_id:  String,
+        user_id:    String,
+        reply_to:   oneshot::Sender<Result<CollaborationResult, String>>,
+    },
+
+    /// Same as `CollaborateAgents` but emits SSE events through `event_tx`.
+    StreamCollaborateAgents {
+        content:    String,
+        agent_ids:  Option<Vec<String>>,
+        session_id: Uuid,
+        tenant_id:  String,
+        user_id:    String,
+        event_tx:   mpsc::Sender<String>,
+    },
 }
 
 impl fmt::Debug for OrchestratorMessage {
@@ -202,6 +249,10 @@ impl fmt::Debug for OrchestratorMessage {
                 write!(f, "GetSagaExecution({execution_id})"),
             Self::ListSagas { .. } =>
                 write!(f, "ListSagas"),
+            Self::CollaborateAgents { session_id, .. } =>
+                write!(f, "CollaborateAgents(session={session_id})"),
+            Self::StreamCollaborateAgents { session_id, .. } =>
+                write!(f, "StreamCollaborateAgents(session={session_id})"),
         }
     }
 }
@@ -525,6 +576,74 @@ impl Actor for OrchestratorActor {
                 let defs: Vec<SagaDefinition> = self.saga_manager
                     .all_definitions().into_iter().cloned().collect();
                 let _ = reply_to.send(defs);
+                Box::pin(async {})
+            }
+
+            // ── Multi-agent collaboration ──
+            OrchestratorMessage::CollaborateAgents {
+                content, agent_ids, session_id, tenant_id, user_id, reply_to
+            } => {
+                let target_ids = resolve_agent_ids(
+                    agent_ids, self.agent_registry.values().map(|a| a.agent_id.clone()).collect()
+                );
+                if target_ids.is_empty() {
+                    let _ = reply_to.send(Err("No agents registered".to_string()));
+                    return Box::pin(async {});
+                }
+                let profiles = self.agent_profiles.clone();
+                let conv   = self.deps.conversation_store.clone();
+                let tools  = self.deps.tool_registry.clone();
+                let claude = self.deps.claude_client.clone();
+                let gemini = self.deps.gemini_client.clone();
+                let openai = self.deps.openai_client.clone();
+                let cfg    = self.deps.llm_config.clone();
+                let prov   = self.deps.llm_provider.clone();
+                let vs     = self.deps.vector_store.clone();
+                let metrics = self.deps.metrics.clone();
+                let cbs    = self.deps.circuit_breakers.clone();
+
+                tokio::spawn(async move {
+                    let result = run_collaboration_engine(
+                        content, target_ids, session_id, tenant_id, user_id,
+                        conv, tools, claude, gemini, openai, cfg, prov,
+                        profiles, vs, metrics, cbs, None,
+                    ).await;
+                    let _ = reply_to.send(result);
+                });
+                Box::pin(async {})
+            }
+
+            OrchestratorMessage::StreamCollaborateAgents {
+                content, agent_ids, session_id, tenant_id, user_id, event_tx
+            } => {
+                let target_ids = resolve_agent_ids(
+                    agent_ids, self.agent_registry.values().map(|a| a.agent_id.clone()).collect()
+                );
+                if target_ids.is_empty() {
+                    let _ = event_tx.try_send(
+                        serde_json::json!({"type":"error","message":"No agents registered"}).to_string()
+                    );
+                    return Box::pin(async {});
+                }
+                let profiles = self.agent_profiles.clone();
+                let conv   = self.deps.conversation_store.clone();
+                let tools  = self.deps.tool_registry.clone();
+                let claude = self.deps.claude_client.clone();
+                let gemini = self.deps.gemini_client.clone();
+                let openai = self.deps.openai_client.clone();
+                let cfg    = self.deps.llm_config.clone();
+                let prov   = self.deps.llm_provider.clone();
+                let vs     = self.deps.vector_store.clone();
+                let metrics = self.deps.metrics.clone();
+                let cbs    = self.deps.circuit_breakers.clone();
+
+                tokio::spawn(async move {
+                    run_collaboration_engine(
+                        content, target_ids, session_id, tenant_id, user_id,
+                        conv, tools, claude, gemini, openai, cfg, prov,
+                        profiles, vs, metrics, cbs, Some(event_tx),
+                    ).await.ok();
+                });
                 Box::pin(async {})
             }
         }
@@ -1597,4 +1716,244 @@ async fn run_workflow_compensations(
     }
 
     results
+}
+
+// ─── Multi-agent collaboration engine ────────────────────────────────────────
+
+/// Resolve which agent IDs to use in a collaboration.
+fn resolve_agent_ids(
+    explicit:    Option<Vec<String>>,
+    all_registered: Vec<String>,
+) -> Vec<String> {
+    match explicit {
+        Some(ids) if !ids.is_empty() => ids,
+        _ => all_registered,
+    }
+}
+
+/// Fan out a query to multiple agents in parallel, then synthesise all
+/// responses into a single coherent answer via a follow-up LLM call.
+///
+/// SSE events (when `event_tx` is Some):
+///   `agent_start`           — before each agent query
+///   `agent_complete`        — after each agent returns
+///   `agent_error`           — if an agent fails
+///   `synthesis_start`       — before the synthesis LLM call
+///   `synthesis_complete`    — final synthesised answer
+#[allow(clippy::too_many_arguments)]
+async fn run_collaboration_engine(
+    content:    String,
+    agent_ids:  Vec<String>,
+    session_id: Uuid,
+    tenant_id:  String,
+    user_id:    String,
+    conv:       Arc<PgConversationStore>,
+    tools:      Arc<RwLock<ToolRegistry>>,
+    claude:     Arc<ClaudeClient>,
+    gemini:     Option<Arc<GeminiClient>>,
+    openai:     Option<Arc<OpenAIClient>>,
+    cfg:        LlmConfig,
+    provider:   String,
+    profiles:   HashMap<String, AgentProfile>,
+    vs:         Option<Arc<PgVectorStore>>,
+    metrics:    Option<Arc<MetricsRegistry>>,
+    cbs:        HashMap<String, CircuitBreaker>,
+    event_tx:   Option<mpsc::Sender<String>>,
+) -> Result<CollaborationResult, String> {
+
+    if let Some(tx) = &event_tx {
+        emit_event(tx, serde_json::json!({
+            "type":        "collaboration_start",
+            "session_id":  session_id,
+            "agent_count": agent_ids.len(),
+            "agents":      agent_ids,
+        })).await;
+    }
+
+    // ── Phase 1: fan out to all agents in parallel ────────────────────────────
+    let mut handles = Vec::with_capacity(agent_ids.len());
+
+    for agent_id in &agent_ids {
+        let agent_id   = agent_id.clone();
+        let content    = content.clone();
+        let tenant_id  = tenant_id.clone();
+        let user_id    = user_id.clone();
+        let profile    = profiles.get(&agent_id).cloned().unwrap_or_default();
+        let conv       = conv.clone();
+        let tools      = tools.clone();
+        let claude     = claude.clone();
+        let gemini     = gemini.clone();
+        let openai     = openai.clone();
+        let cfg        = cfg.clone();
+        let provider   = provider.clone();
+        let vs         = vs.clone();
+        let metrics    = metrics.clone();
+        let cb         = cbs.get(&provider).cloned();
+        let tx         = event_tx.clone();
+
+        let step_sid = Uuid::new_v4();
+
+        if let Some(tx) = &tx {
+            emit_event(tx, serde_json::json!({
+                "type":     "agent_start",
+                "agent_id": agent_id,
+            })).await;
+        }
+
+        let handle = tokio::spawn(async move {
+            let result = run_query_loop(
+                agent_id.clone(), content, step_sid,
+                tenant_id, user_id,
+                conv, tools, claude, gemini, openai,
+                cfg, provider, profile, vs, metrics, cb,
+            ).await;
+
+            match result {
+                Ok(qr) => {
+                    if let Some(tx) = &tx {
+                        let _ = tx.send(serde_json::json!({
+                            "type":       "agent_complete",
+                            "agent_id":   agent_id,
+                            "tools_used": qr.tools_used,
+                        }).to_string()).await;
+                    }
+                    AgentResponse {
+                        agent_id:      qr.agent_id,
+                        response:      qr.response,
+                        tools_used:    qr.tools_used,
+                        input_tokens:  qr.input_tokens,
+                        output_tokens: qr.output_tokens,
+                        error:         None,
+                    }
+                }
+                Err(e) => {
+                    warn!(agent_id = %agent_id, error = %e, "Agent failed in collaboration");
+                    if let Some(tx) = &tx {
+                        let _ = tx.send(serde_json::json!({
+                            "type":     "agent_error",
+                            "agent_id": agent_id,
+                            "error":    e,
+                        }).to_string()).await;
+                    }
+                    AgentResponse {
+                        agent_id,
+                        response:      String::new(),
+                        tools_used:    Vec::new(),
+                        input_tokens:  0,
+                        output_tokens: 0,
+                        error:         Some(e),
+                    }
+                }
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    let agent_responses: Vec<AgentResponse> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let total_in: u32  = agent_responses.iter().map(|r| r.input_tokens).sum();
+    let total_out: u32 = agent_responses.iter().map(|r| r.output_tokens).sum();
+
+    // ── Phase 2: synthesise ───────────────────────────────────────────────────
+
+    if let Some(tx) = &event_tx {
+        emit_event(tx, serde_json::json!({
+            "type":           "synthesis_start",
+            "responding_agents": agent_responses.iter()
+                .filter(|r| r.error.is_none()).count(),
+        })).await;
+    }
+
+    let synthesis = synthesise_responses(&content, &agent_responses,
+        &provider, &claude, gemini.as_deref(), openai.as_deref(), &cfg,
+        cbs.get(&provider),
+    ).await.unwrap_or_else(|e| {
+        warn!(error = %e, "Synthesis LLM call failed — falling back to concatenation");
+        agent_responses.iter()
+            .filter(|r| r.error.is_none())
+            .map(|r| format!("[{}]\n{}", r.agent_id, r.response))
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n")
+    });
+
+    if let Some(tx) = &event_tx {
+        emit_event(tx, serde_json::json!({
+            "type":       "synthesis_complete",
+            "session_id": session_id,
+            "synthesis":  synthesis,
+        })).await;
+    }
+
+    Ok(CollaborationResult {
+        session_id,
+        query: content,
+        agent_responses,
+        synthesis,
+        total_in_tokens:  total_in,
+        total_out_tokens: total_out,
+    })
+}
+
+/// Produce a single coherent answer from multiple agent responses.
+async fn synthesise_responses(
+    original_query: &str,
+    responses:      &[AgentResponse],
+    provider:       &str,
+    claude:         &ClaudeClient,
+    gemini:         Option<&GeminiClient>,
+    openai:         Option<&OpenAIClient>,
+    cfg:            &LlmConfig,
+    cb:             Option<&CircuitBreaker>,
+) -> Result<String, String> {
+    let successful: Vec<&AgentResponse> = responses.iter().filter(|r| r.error.is_none()).collect();
+
+    if successful.is_empty() {
+        return Err("모든 에이전트 호출이 실패했습니다.".to_string());
+    }
+
+    if successful.len() == 1 {
+        return Ok(successful[0].response.clone());
+    }
+
+    let agents_text = successful.iter().map(|r| {
+        format!("## {} 에이전트 분석\n\n{}", r.agent_id, r.response)
+    }).collect::<Vec<_>>().join("\n\n");
+
+    let synthesis_prompt = format!(
+        "당신은 여러 전문 에이전트의 분석 결과를 통합하는 EHS 종합 AI입니다.\n\n\
+         [원래 질문]\n{original_query}\n\n\
+         [각 에이전트의 분석 결과]\n{agents_text}\n\n\
+         [지침]\n\
+         - 각 에이전트의 핵심 내용을 빠짐없이 포함하세요.\n\
+         - 중복 내용은 통합하고, 모순이 있으면 명시하세요.\n\
+         - 전체적인 결론과 권고사항을 제시하세요.\n\
+         - 한국어로 답변하세요.\n\
+         - 응답은 마크다운 형식으로 작성하세요."
+    );
+
+    let request = LlmRequest {
+        messages:      vec![pekko_agent_llm::ClaudeMessage {
+            role:    "user".to_string(),
+            content: vec![pekko_agent_llm::ContentBlock::Text { text: synthesis_prompt }],
+        }],
+        system_prompt: "당신은 EHS 멀티-에이전트 종합 분석 AI입니다.".to_string(),
+        max_tokens:    cfg.max_tokens,
+        temperature:   Some(cfg.temperature),
+        tools:         Vec::new(),
+        cacheable:     false,
+    };
+
+    let response = call_llm_protected(provider, &request, claude, gemini, openai, cb, None).await?;
+
+    Ok(response.content.iter()
+        .filter_map(|b| if let pekko_agent_llm::ContentBlock::Text { text } = b {
+            Some(text.as_str())
+        } else { None })
+        .collect::<Vec<_>>()
+        .join(""))
 }
