@@ -34,6 +34,7 @@ use pekko_agent_orchestrator::{
     OrchestratorPersistence,
     Workflow, WorkflowResult,
 };
+use pekko_agent_orchestrator::saga::{SagaDefinition, SagaResult};
 use pekko_agent_events::EventPublisher;
 use pekko_agent_security::{
     AuditLogger, AuditEntry, AuditOutcome, Claims, JwtError, JwtManager, RbacManager,
@@ -295,19 +296,26 @@ fn path_label(path: &str) -> &'static str {
         "/api/workflows/:id"
     } else if path.starts_with("/api/memory/") && !path.ends_with("/store") && !path.ends_with("/search") {
         "/api/memory/:id"
+    } else if path.starts_with("/api/sagas/") && path.ends_with("/execute") {
+        "/api/sagas/:id/execute"
+    } else if path.starts_with("/api/sagas/") && path.ends_with("/stream") {
+        "/api/sagas/:id/stream"
+    } else if path.starts_with("/api/sagas/executions/") {
+        "/api/sagas/executions/:id"
     } else {
         match path {
-            "/api/health"             => "/api/health",
-            "/api/auth/token"         => "/api/auth/token",
-            "/api/agents"             => "/api/agents",
-            "/api/agents/register"    => "/api/agents/register",
-            "/api/tools"              => "/api/tools",
-            "/api/workflows"          => "/api/workflows",
-            "/api/workflows/stream"   => "/api/workflows/stream",
-            "/api/memory/store"       => "/api/memory/store",
-            "/api/memory/search"      => "/api/memory/search",
-            "/metrics"                => "/metrics",
-            _                         => "other",
+            "/api/health"               => "/api/health",
+            "/api/auth/token"           => "/api/auth/token",
+            "/api/agents"               => "/api/agents",
+            "/api/agents/register"      => "/api/agents/register",
+            "/api/tools"                => "/api/tools",
+            "/api/workflows"            => "/api/workflows",
+            "/api/workflows/stream"     => "/api/workflows/stream",
+            "/api/memory/store"         => "/api/memory/store",
+            "/api/memory/search"        => "/api/memory/search",
+            "/api/sagas/definitions"    => "/api/sagas/definitions",
+            "/metrics"                  => "/metrics",
+            _                           => "other",
         }
     }
 }
@@ -838,6 +846,117 @@ async fn get_workflow_status(
     }
 }
 
+// ── Saga endpoints ────────────────────────────────────────────────────────────
+
+/// POST /api/sagas/definitions  — register a SagaDefinition; requires admin.all
+async fn register_saga(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+    Json(saga):   Json<SagaDefinition>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin.all").await?;
+    let saga_id = saga.saga_id;
+
+    state.orchestrator_ref
+        .tell(OrchestratorMessage::RegisterSaga(saga))
+        .map_err(|_| service_unavailable("Orchestrator actor unavailable"))?;
+
+    Ok(Json(serde_json::json!({
+        "saga_id": saga_id,
+        "message": "Saga registered"
+    })))
+}
+
+/// GET /api/sagas/definitions  — list all registered saga definitions
+async fn list_sagas(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "memory.read").await?;
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    state.orchestrator_ref
+        .tell(OrchestratorMessage::ListSagas { reply_to: reply_tx })
+        .map_err(|_| service_unavailable("Orchestrator actor unavailable"))?;
+
+    let defs = reply_rx.await
+        .map_err(|_| internal_error("Orchestrator did not reply"))?;
+
+    Ok(Json(defs).into_response())
+}
+
+/// POST /api/sagas/:saga_id/execute  — execute a saga synchronously; requires agent.delegate
+async fn execute_saga(
+    auth:            AuthUser,
+    Path(saga_id):   Path<Uuid>,
+    State(state):    State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "agent.delegate").await?;
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    state.orchestrator_ref
+        .tell(OrchestratorMessage::ExecuteSaga {
+            saga_id,
+            reply_to: reply_tx,
+        })
+        .map_err(|_| service_unavailable("Orchestrator actor unavailable"))?;
+
+    let result = reply_rx.await
+        .map_err(|_| internal_error("Orchestrator did not reply"))?
+        .map_err(|e| internal_error(&e))?;
+
+    Ok(Json(result).into_response())
+}
+
+/// POST /api/sagas/:saga_id/stream  — stream a saga execution via SSE
+async fn stream_saga(
+    auth:          AuthUser,
+    Path(saga_id): Path<Uuid>,
+    State(state):  State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "agent.delegate").await?;
+
+    let (event_tx, mut event_rx) = mpsc::channel::<String>(256);
+
+    state.orchestrator_ref
+        .tell(OrchestratorMessage::StreamSaga { saga_id, event_tx })
+        .map_err(|_| service_unavailable("Orchestrator actor unavailable"))?;
+
+    let stream = stream::unfold(event_rx, |mut rx| async move {
+        rx.recv().await.map(|data| {
+            (Ok::<Event, Infallible>(Event::default().data(data)), rx)
+        })
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
+}
+
+/// GET /api/sagas/executions/:exec_id  — get saga execution snapshot
+async fn get_saga_execution(
+    auth:          AuthUser,
+    Path(exec_id): Path<Uuid>,
+    State(state):  State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "memory.read").await?;
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    state.orchestrator_ref
+        .tell(OrchestratorMessage::GetSagaExecution {
+            execution_id: exec_id,
+            reply_to:     reply_tx,
+        })
+        .map_err(|_| service_unavailable("Orchestrator actor unavailable"))?;
+
+    let exec = reply_rx.await
+        .map_err(|_| internal_error("Orchestrator did not reply"))?;
+
+    match exec {
+        Some(e) => Ok(Json(e).into_response()),
+        None    => Err(make_error(StatusCode::NOT_FOUND, "NOT_FOUND",
+            format!("Saga execution {exec_id} not found"))),
+    }
+}
+
 // ── Agent registration endpoint ───────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -1161,12 +1280,17 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/memory/store",                  post(memory_store))
         .route("/api/memory/search",                 post(memory_search))
         .route("/api/memory/:doc_id",                axum::routing::delete(memory_delete))
+        // ── Saga ──
+        .route("/api/sagas/definitions",             post(register_saga).get(list_sagas))
+        .route("/api/sagas/:saga_id/execute",        post(execute_saga))
+        .route("/api/sagas/executions/:exec_id",     get(get_saga_execution))
         .layer(TimeoutLayer::new(BLOCKING_TIMEOUT));
 
     let streaming_protected = Router::new()
         .route("/api/agents/:agent_id/query/stream", post(stream_query_agent))
         .route("/api/agents/:agent_id/ws",           get(ws_agent))
-        .route("/api/workflows/stream",              post(stream_workflow));
+        .route("/api/workflows/stream",              post(stream_workflow))
+        .route("/api/sagas/:saga_id/stream",         post(stream_saga));
 
     let port: u16 = std::env::var("API_GATEWAY_PORT")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(8080);

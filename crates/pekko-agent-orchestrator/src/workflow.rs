@@ -23,6 +23,10 @@ pub struct WorkflowStep {
     pub output_key: String,
     pub depends_on: Vec<String>,
     pub timeout_ms: u64,
+    /// Optional LLM prompt that undoes this step's side-effects.
+    /// Executed when a later step fails and the saga compensates.
+    #[serde(default)]
+    pub compensation_action: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -33,6 +37,12 @@ pub enum WorkflowStatus {
     Completed,
     Failed { at_step: usize, error: String },
     Cancelled,
+    /// Saga compensation in progress after a step failure.
+    Compensating { failed_at: usize, compensating_step: usize },
+    /// All compensation steps completed successfully.
+    Compensated,
+    /// One or more compensation steps also failed.
+    CompensationFailed { error: String },
 }
 
 impl Workflow {

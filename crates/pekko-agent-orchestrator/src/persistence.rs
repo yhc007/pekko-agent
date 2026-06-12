@@ -209,12 +209,15 @@ impl OrchestratorPersistence {
 
 fn workflow_status_label(status: &WorkflowStatus) -> &'static str {
     match status {
-        WorkflowStatus::Created                  => "created",
-        WorkflowStatus::Running { .. }           => "running",
-        WorkflowStatus::Paused  { .. }           => "paused",
-        WorkflowStatus::Completed                => "completed",
-        WorkflowStatus::Failed  { .. }           => "failed",
-        WorkflowStatus::Cancelled                => "cancelled",
+        WorkflowStatus::Created                    => "created",
+        WorkflowStatus::Running { .. }             => "running",
+        WorkflowStatus::Paused  { .. }             => "paused",
+        WorkflowStatus::Completed                  => "completed",
+        WorkflowStatus::Failed  { .. }             => "failed",
+        WorkflowStatus::Cancelled                  => "cancelled",
+        WorkflowStatus::Compensating { .. }        => "compensating",
+        WorkflowStatus::Compensated                => "compensated",
+        WorkflowStatus::CompensationFailed { .. }  => "compensation_failed",
     }
 }
 

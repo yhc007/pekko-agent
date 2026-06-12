@@ -42,7 +42,7 @@ use pekko_agent_observability::MetricsRegistry;
 use pekko_agent_tools::ToolRegistry;
 
 use crate::workflow::{build_step_content, topological_sort, Workflow, WorkflowResult, WorkflowStatus};
-use crate::saga::SagaManager;
+use crate::saga::{run_saga_engine, SagaDefinition, SagaExecution, SagaManager, SagaResult, SagaStatus};
 use crate::persistence::{OrchestratorPersistence, spawn_save_agent, spawn_save_workflow};
 
 // ─── Service dependencies ────────────────────────────────────────────────────
@@ -141,6 +141,34 @@ pub enum OrchestratorMessage {
         workflow_id: Uuid,
         reply_to:    oneshot::Sender<Option<WorkflowStatus>>,
     },
+
+    // ── Saga pattern ──
+
+    /// Register a `SagaDefinition` so it can be executed by ID later.
+    RegisterSaga(SagaDefinition),
+
+    /// Execute a saga by definition ID; result returned via oneshot.
+    ExecuteSaga {
+        saga_id:  Uuid,
+        reply_to: oneshot::Sender<Result<SagaResult, String>>,
+    },
+
+    /// Stream a saga execution; SSE events go through `event_tx`.
+    StreamSaga {
+        saga_id:  Uuid,
+        event_tx: mpsc::Sender<String>,
+    },
+
+    /// Return a snapshot of a running/completed saga execution.
+    GetSagaExecution {
+        execution_id: Uuid,
+        reply_to:     oneshot::Sender<Option<SagaExecution>>,
+    },
+
+    /// List all registered saga definitions.
+    ListSagas {
+        reply_to: oneshot::Sender<Vec<SagaDefinition>>,
+    },
 }
 
 impl fmt::Debug for OrchestratorMessage {
@@ -164,6 +192,16 @@ impl fmt::Debug for OrchestratorMessage {
                 write!(f, "StreamWorkflow({})", workflow.name),
             Self::GetWorkflowStatus { workflow_id, .. } =>
                 write!(f, "GetWorkflowStatus({workflow_id})"),
+            Self::RegisterSaga(s) =>
+                write!(f, "RegisterSaga({})", s.saga_id),
+            Self::ExecuteSaga { saga_id, .. } =>
+                write!(f, "ExecuteSaga({saga_id})"),
+            Self::StreamSaga { saga_id, .. } =>
+                write!(f, "StreamSaga({saga_id})"),
+            Self::GetSagaExecution { execution_id, .. } =>
+                write!(f, "GetSagaExecution({execution_id})"),
+            Self::ListSagas { .. } =>
+                write!(f, "ListSagas"),
         }
     }
 }
@@ -176,7 +214,6 @@ pub struct OrchestratorActor {
     agent_profiles: HashMap<String, AgentProfile>,
     task_queue:     VecDeque<AgentTask>,
     active_tasks:   HashMap<Uuid, TaskExecution>,
-    #[allow(dead_code)]
     saga_manager:   SagaManager,
     deps:           OrchestratorDeps,
 }
@@ -421,6 +458,73 @@ impl Actor for OrchestratorActor {
             OrchestratorMessage::GetWorkflowStatus { workflow_id, reply_to } => {
                 let status = self.workflows.get(&workflow_id).map(|w| w.status.clone());
                 let _ = reply_to.send(status);
+                Box::pin(async {})
+            }
+
+            // ── Saga ──
+            OrchestratorMessage::RegisterSaga(saga) => {
+                self.saga_manager.register(saga);
+                Box::pin(async {})
+            }
+
+            OrchestratorMessage::ExecuteSaga { saga_id, reply_to } => {
+                let Some(saga) = self.saga_manager.get_definition(&saga_id).cloned() else {
+                    let _ = reply_to.send(Err(format!("Saga '{saga_id}' not registered")));
+                    return Box::pin(async {});
+                };
+                let conv   = self.deps.conversation_store.clone();
+                let tools  = self.deps.tool_registry.clone();
+                let claude = self.deps.claude_client.clone();
+                let gemini = self.deps.gemini_client.clone();
+                let openai = self.deps.openai_client.clone();
+                let cfg    = self.deps.llm_config.clone();
+                let prov   = self.deps.llm_provider.clone();
+                let prof   = self.agent_profiles.clone();
+
+                tokio::spawn(async move {
+                    let result = run_saga_engine(
+                        saga, conv, tools, claude, gemini, openai, cfg, prov, prof, None,
+                    ).await;
+                    let _ = reply_to.send(Ok(result));
+                });
+                Box::pin(async {})
+            }
+
+            OrchestratorMessage::StreamSaga { saga_id, event_tx } => {
+                let Some(saga) = self.saga_manager.get_definition(&saga_id).cloned() else {
+                    let msg = format!("Saga '{saga_id}' not registered");
+                    let _ = event_tx.try_send(
+                        serde_json::json!({"type":"error","message": msg}).to_string()
+                    );
+                    return Box::pin(async {});
+                };
+                let conv   = self.deps.conversation_store.clone();
+                let tools  = self.deps.tool_registry.clone();
+                let claude = self.deps.claude_client.clone();
+                let gemini = self.deps.gemini_client.clone();
+                let openai = self.deps.openai_client.clone();
+                let cfg    = self.deps.llm_config.clone();
+                let prov   = self.deps.llm_provider.clone();
+                let prof   = self.agent_profiles.clone();
+
+                tokio::spawn(async move {
+                    run_saga_engine(
+                        saga, conv, tools, claude, gemini, openai, cfg, prov, prof, Some(event_tx),
+                    ).await;
+                });
+                Box::pin(async {})
+            }
+
+            OrchestratorMessage::GetSagaExecution { execution_id, reply_to } => {
+                let exec = self.saga_manager.get_execution(&execution_id).cloned();
+                let _ = reply_to.send(exec);
+                Box::pin(async {})
+            }
+
+            OrchestratorMessage::ListSagas { reply_to } => {
+                let defs: Vec<SagaDefinition> = self.saga_manager
+                    .all_definitions().into_iter().cloned().collect();
+                let _ = reply_to.send(defs);
                 Box::pin(async {})
             }
         }
@@ -676,6 +780,26 @@ async fn call_llm_protected(
 }
 
 // ─── Blocking query loop ──────────────────────────────────────────────────────
+
+/// Public re-export so `saga.rs` can call into the query loop.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_query_loop_pub(
+    agent_id: String, content: String, session_id: Uuid,
+    tenant_id: String, user_id: String,
+    conv: Arc<PgConversationStore>, tools: Arc<RwLock<ToolRegistry>>,
+    claude: Arc<ClaudeClient>, gemini: Option<Arc<GeminiClient>>,
+    openai: Option<Arc<OpenAIClient>>, cfg: LlmConfig, provider: String,
+    profile: AgentProfile,
+    vs: Option<Arc<PgVectorStore>>,
+    metrics: Option<Arc<MetricsRegistry>>,
+    cb: Option<CircuitBreaker>,
+) -> Result<QueryResult, String> {
+    run_query_loop(
+        agent_id, content, session_id, tenant_id, user_id,
+        conv, tools, claude, gemini, openai, cfg, provider,
+        profile, vs, metrics, cb,
+    ).await
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn run_query_loop(
@@ -1267,31 +1391,47 @@ async fn run_workflow_engine(
                 }
             }
             Ok(Err(e)) => {
-                workflow.status = WorkflowStatus::Failed { at_step: exec_idx, error: e.clone() };
+                let err_msg = e;
                 if let Some(tx) = &event_tx {
                     emit_event(tx, serde_json::json!({
-                        "type": "step_failed", "step_id": step_id, "error": e
+                        "type": "step_failed", "step_id": step_id, "error": err_msg
                     })).await;
                 }
+                workflow.status = step_failure_status(
+                    &workflow.steps, &order[..exec_idx], &context,
+                    &conv, &tools, &claude, &gemini, &openai,
+                    &cfg, &provider, &profiles, &event_tx,
+                    exec_idx, &err_msg, &wf_id,
+                ).await;
+
                 return Ok(WorkflowResult {
-                    workflow_id: wf_id, name: wf_name, status: workflow.status,
+                    workflow_id: wf_id, name: wf_name,
+                    status: workflow.status.clone(),
                     context, completed_steps,
-                    failed_step: Some(step_id), error: Some(e),
+                    failed_step: Some(step_id),
+                    error: Some(err_msg),
                 });
             }
             Err(_) => {
-                let e = format!("Step '{step_id}' timed out after {}ms", step.timeout_ms);
-                workflow.status = WorkflowStatus::Failed { at_step: exec_idx, error: e.clone() };
+                let err_msg = format!("Step '{step_id}' timed out after {}ms", step.timeout_ms);
                 if let Some(tx) = &event_tx {
                     emit_event(tx, serde_json::json!({
-                        "type": "step_timeout", "step_id": step_id,
-                        "timeout_ms": step.timeout_ms
+                        "type": "step_timeout", "step_id": step_id, "error": err_msg
                     })).await;
                 }
+                workflow.status = step_failure_status(
+                    &workflow.steps, &order[..exec_idx], &context,
+                    &conv, &tools, &claude, &gemini, &openai,
+                    &cfg, &provider, &profiles, &event_tx,
+                    exec_idx, &err_msg, &wf_id,
+                ).await;
+
                 return Ok(WorkflowResult {
-                    workflow_id: wf_id, name: wf_name, status: workflow.status,
+                    workflow_id: wf_id, name: wf_name,
+                    status: workflow.status.clone(),
                     context, completed_steps,
-                    failed_step: Some(step_id), error: Some(e),
+                    failed_step: Some(step_id),
+                    error: Some(err_msg),
                 });
             }
         }
@@ -1315,4 +1455,146 @@ async fn run_workflow_engine(
         failed_step: None,
         error:       None,
     })
+}
+
+// ─── Workflow compensation helpers ───────────────────────────────────────────
+
+/// Determine the final `WorkflowStatus` after a step fails.
+/// Runs compensating actions in reverse for any completed steps that declared
+/// `compensation_action`; returns the appropriate terminal status.
+#[allow(clippy::too_many_arguments)]
+async fn step_failure_status(
+    steps:           &[crate::workflow::WorkflowStep],
+    completed_order: &[usize],
+    context:         &HashMap<String, serde_json::Value>,
+    conv:            &Arc<PgConversationStore>,
+    tools:           &Arc<RwLock<ToolRegistry>>,
+    claude:          &Arc<ClaudeClient>,
+    gemini:          &Option<Arc<GeminiClient>>,
+    openai:          &Option<Arc<OpenAIClient>>,
+    cfg:             &LlmConfig,
+    provider:        &str,
+    profiles:        &HashMap<String, AgentProfile>,
+    event_tx:        &Option<mpsc::Sender<String>>,
+    failed_at:       usize,
+    err_msg:         &str,
+    wf_id:           &Uuid,
+) -> WorkflowStatus {
+    let comp_results = run_workflow_compensations(
+        steps, completed_order, context,
+        conv, tools, claude, gemini, openai,
+        cfg, provider, profiles, event_tx, failed_at,
+    ).await;
+
+    if comp_results.is_empty() {
+        return WorkflowStatus::Failed { at_step: failed_at, error: err_msg.to_string() };
+    }
+
+    let comp_failed = comp_results.iter().any(|r| r.starts_with("FAILED:"));
+    if let Some(tx) = event_tx {
+        emit_event(tx, serde_json::json!({
+            "type": if comp_failed { "workflow_compensation_failed" } else { "workflow_compensated" },
+            "workflow_id":       wf_id,
+            "compensated_steps": comp_results.len()
+        })).await;
+    }
+
+    if comp_failed {
+        WorkflowStatus::CompensationFailed { error: err_msg.to_string() }
+    } else {
+        WorkflowStatus::Compensated
+    }
+}
+
+/// Run compensating LLM calls for completed steps in reverse order.
+/// Returns one String per compensated step (prefixed "FAILED:" on error).
+#[allow(clippy::too_many_arguments)]
+async fn run_workflow_compensations(
+    steps:           &[crate::workflow::WorkflowStep],
+    completed_order: &[usize],
+    context:         &HashMap<String, serde_json::Value>,
+    conv:            &Arc<PgConversationStore>,
+    tools:           &Arc<RwLock<ToolRegistry>>,
+    claude:          &Arc<ClaudeClient>,
+    gemini:          &Option<Arc<GeminiClient>>,
+    openai:          &Option<Arc<OpenAIClient>>,
+    cfg:             &LlmConfig,
+    provider:        &str,
+    profiles:        &HashMap<String, AgentProfile>,
+    event_tx:        &Option<mpsc::Sender<String>>,
+    failed_at:       usize,
+) -> Vec<String> {
+    let mut results = Vec::new();
+
+    for &step_idx in completed_order.iter().rev() {
+        let step = &steps[step_idx];
+        let Some(comp_action) = &step.compensation_action else { continue; };
+
+        let prior_output = context.get(&step.output_key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("(결과 없음)");
+
+        let comp_content = format!(
+            "[보상 트랜잭션] 워크플로우 단계 '{}' 의 작업을 취소/보상합니다.\n\
+             실패 위치: step {failed_at}\n\n\
+             보상 지침: {comp_action}\n\n\
+             이전 단계 출력:\n{prior_output}",
+            step.step_id,
+        );
+
+        if let Some(tx) = event_tx {
+            emit_event(tx, serde_json::json!({
+                "type":     "compensation_step_start",
+                "step_id":  step.step_id,
+                "step_idx": step_idx
+            })).await;
+        }
+
+        let profile = profiles.get(&step.agent_type).cloned().unwrap_or_default();
+        let timeout = Duration::from_millis(step.timeout_ms);
+
+        let comp_result = tokio::time::timeout(
+            timeout,
+            run_query_loop(
+                step.agent_type.clone(), comp_content, Uuid::new_v4(),
+                "workflow-compensation".to_string(), "system".to_string(),
+                conv.clone(), tools.clone(),
+                claude.clone(), gemini.clone(), openai.clone(),
+                cfg.clone(), provider.to_string(), profile,
+                None, None, None,
+            ),
+        ).await;
+
+        let entry = match comp_result {
+            Ok(Ok(qr)) => {
+                if let Some(tx) = event_tx {
+                    emit_event(tx, serde_json::json!({
+                        "type":     "compensation_step_complete",
+                        "step_id":  step.step_id,
+                        "response": qr.response
+                    })).await;
+                }
+                qr.response
+            }
+            Ok(Err(e)) => {
+                warn!(step_id = %step.step_id, error = %e, "Workflow compensation step failed");
+                if let Some(tx) = event_tx {
+                    emit_event(tx, serde_json::json!({
+                        "type":    "compensation_step_failed",
+                        "step_id": step.step_id,
+                        "error":   e
+                    })).await;
+                }
+                format!("FAILED: {e}")
+            }
+            Err(_) => {
+                let msg = format!("Compensation for '{}' timed out", step.step_id);
+                warn!("{msg}");
+                format!("FAILED: {msg}")
+            }
+        };
+        results.push(entry);
+    }
+
+    results
 }
