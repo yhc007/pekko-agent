@@ -1,0 +1,215 @@
+# ============================================================================
+# EHS Agent Deployments
+# 세 에이전트는 동일한 패턴: api-gateway 헬스체크 후 자기 등록
+# ============================================================================
+
+# ── 공통 env 헬퍼 (anchor) ─────────────────────────────────────────────────
+# 아래 각 Deployment에서 동일 환경변수 세트를 참조합니다.
+
+---
+# ── ehs-permit-agent ──────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ehs-permit-agent
+  namespace: pekko-agent
+  labels:
+    app: ehs-permit-agent
+    app.kubernetes.io/component: agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ehs-permit-agent
+  template:
+    metadata:
+      labels:
+        app: ehs-permit-agent
+    spec:
+      initContainers:
+        - name: wait-for-gateway
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until wget -qO- http://api-gateway:8080/api/health > /dev/null 2>&1; do
+                echo "Waiting for api-gateway..."
+                sleep 5
+              done
+              echo "api-gateway is ready."
+      containers:
+        - name: ehs-permit-agent
+          image: pekko-agent/ehs-permit-agent:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: pekko-agent-config
+          env:
+            - name: CLAUDE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: pekko-agent-secrets
+                  key: CLAUDE_API_KEY
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: pekko-agent-secrets
+                  key: JWT_SECRET
+            - name: AGENT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: pekko-agent-secrets
+                  key: AGENT_API_KEY
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pekko-agent-secrets
+                  key: POSTGRES_PASSWORD
+            - name: DATABASE_URL
+              value: "postgres://pekko:$(POSTGRES_PASSWORD)@postgres:5432/pekko_agent"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+
+---
+# ── ehs-inspection-agent ──────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ehs-inspection-agent
+  namespace: pekko-agent
+  labels:
+    app: ehs-inspection-agent
+    app.kubernetes.io/component: agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ehs-inspection-agent
+  template:
+    metadata:
+      labels:
+        app: ehs-inspection-agent
+    spec:
+      initContainers:
+        - name: wait-for-gateway
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until wget -qO- http://api-gateway:8080/api/health > /dev/null 2>&1; do
+                echo "Waiting for api-gateway..."
+                sleep 5
+              done
+      containers:
+        - name: ehs-inspection-agent
+          image: pekko-agent/ehs-inspection-agent:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: pekko-agent-config
+          env:
+            - name: CLAUDE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: pekko-agent-secrets
+                  key: CLAUDE_API_KEY
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: pekko-agent-secrets
+                  key: JWT_SECRET
+            - name: AGENT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: pekko-agent-secrets
+                  key: AGENT_API_KEY
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pekko-agent-secrets
+                  key: POSTGRES_PASSWORD
+            - name: DATABASE_URL
+              value: "postgres://pekko:$(POSTGRES_PASSWORD)@postgres:5432/pekko_agent"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+
+---
+# ── ehs-compliance-agent ──────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ehs-compliance-agent
+  namespace: pekko-agent
+  labels:
+    app: ehs-compliance-agent
+    app.kubernetes.io/component: agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ehs-compliance-agent
+  template:
+    metadata:
+      labels:
+        app: ehs-compliance-agent
+    spec:
+      initContainers:
+        - name: wait-for-gateway
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until wget -qO- http://api-gateway:8080/api/health > /dev/null 2>&1; do
+                echo "Waiting for api-gateway..."
+                sleep 5
+              done
+      containers:
+        - name: ehs-compliance-agent
+          image: pekko-agent/ehs-compliance-agent:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: pekko-agent-config
+          env:
+            - name: CLAUDE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: pekko-agent-secrets
+                  key: CLAUDE_API_KEY
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: pekko-agent-secrets
+                  key: JWT_SECRET
+            - name: AGENT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: pekko-agent-secrets
+                  key: AGENT_API_KEY
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pekko-agent-secrets
+                  key: POSTGRES_PASSWORD
+            - name: DATABASE_URL
+              value: "postgres://pekko:$(POSTGRES_PASSWORD)@postgres:5432/pekko_agent"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"

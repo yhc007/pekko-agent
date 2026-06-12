@@ -1,0 +1,38 @@
+# ============================================================================
+# Ingress — api-gateway를 외부에 노출합니다.
+# nginx ingress controller 가정 (cert-manager 옵션).
+#
+# 적용:
+#   kubectl apply -f 06-ingress.yaml
+#
+# TLS 인증서 자동화 (cert-manager):
+#   kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+#   # 그 다음 아래 ClusterIssuer 생성 후 tls 섹션 주석 해제
+# ============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-gateway-ingress
+  namespace: pekko-agent
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target:  /
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: pekko-agent.example.com   # 실제 도메인으로 변경
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 8080
+  # tls:
+  #   - hosts:
+  #       - pekko-agent.example.com
+  #     secretName: pekko-agent-tls

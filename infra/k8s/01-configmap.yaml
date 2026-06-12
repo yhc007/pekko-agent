@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pekko-agent-config
+  namespace: pekko-agent
+data:
+  RUST_LOG:                  "info"
+  LLM_PROVIDER:              "claude"
+  CLAUDE_MODEL:              "claude-sonnet-4-20250514"
+  CLAUDE_MAX_TOKENS:         "4096"
+  API_GATEWAY_PORT:          "8080"
+  RATE_LIMIT_ADMIN_RPM:      "1000"
+  RATE_LIMIT_AGENT_RPM:      "300"
+  RATE_LIMIT_DEFAULT_RPM:    "60"
+  CB_MAX_FAILURES:           "5"
+  CB_CALL_TIMEOUT_SECS:      "30"
+  CB_RESET_TIMEOUT_SECS:     "60"
+  DISABLE_VECTOR_STORE:      "true"
+  GATEWAY_URL:               "http://api-gateway:8080"

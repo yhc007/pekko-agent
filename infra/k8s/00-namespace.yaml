@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pekko-agent
+  labels:
+    app.kubernetes.io/name: pekko-agent
+    app.kubernetes.io/managed-by: kubectl

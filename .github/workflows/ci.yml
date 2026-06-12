@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Unit Tests ────────────────────────────────────────────────────────────
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build artefacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run unit tests (library crates — no DB required)
+        run: |
+          cargo test \
+            -p pekko-agent-events \
+            -p pekko-agent-orchestrator \
+            -p pekko-agent-security \
+            -p pekko-agent-memory \
+            -p pekko-agent-tools \
+            -- --test-threads=4
+
+  # ── Workspace Compile Check ───────────────────────────────────────────────
+  check:
+    name: Compile Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-check-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cargo check (entire workspace)
+        run: cargo check --workspace
+
+  # ── Clippy Lint ───────────────────────────────────────────────────────────
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run clippy (library crates)
+        run: |
+          cargo clippy \
+            -p pekko-agent-core \
+            -p pekko-agent-events \
+            -p pekko-agent-orchestrator \
+            -p pekko-agent-security \
+            -p pekko-agent-memory \
+            -p pekko-agent-tools \
+            -- -W clippy::all
+
+  # ── Docker Build Smoke Test ───────────────────────────────────────────────
+  docker-build:
+    name: Docker Build (api-gateway)
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    needs: [test, check]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build api-gateway image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: infra/Dockerfile
+          build-args: SERVICE=api-gateway
+          push: false
+          tags: pekko-agent/api-gateway:${{ github.sha }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max

@@ -1,28 +1,58 @@
-# Multi-stage Rust build
-FROM rust:1.78-slim as builder
+# ============================================================================
+# pekko-agent Multi-Stage Docker Build
+# ============================================================================
+# 빌드:  docker build --build-arg SERVICE=api-gateway -t pekko-agent/api-gateway .
+# 실행:  docker run -p 8080:8080 --env-file .env pekko-agent/api-gateway
+# ============================================================================
 
-RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+# ── Stage 1: Builder ─────────────────────────────────────────────────────────
+FROM rust:1.82-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY Cargo.toml Cargo.lock* ./
-COPY crates/ crates/
+
+# Copy manifests first for better layer caching
+COPY Cargo.toml Cargo.lock ./
+
+# Copy workspace members
+COPY crates/   crates/
 COPY services/ services/
-COPY proto/ proto/
+COPY proto/    proto/
 
+# Build argument: which service binary to produce
 ARG SERVICE=api-gateway
 
-# Build workspace first for dependency caching
-RUN cargo build --release -p ${SERVICE}
+# Release build (single service to minimize compile time)
+RUN cargo build --release -p ${SERVICE} \
+    && strip /app/target/release/${SERVICE}
 
-# Runtime stage
-FROM debian:bookworm-slim
+# ── Stage 2: Runtime ─────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
 
-RUN apt-get update && apt-get install -y ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
 ARG SERVICE=api-gateway
+ENV SERVICE_NAME=${SERVICE}
+
 COPY --from=builder /app/target/release/${SERVICE} /usr/local/bin/service
 
-ENV RUST_LOG=info
-EXPOSE 8080 50051 50052 50053 50054 50055 50056 50057 50058
+# Non-root user for security
+RUN useradd --no-create-home --shell /bin/false pekko
+USER pekko
 
-CMD ["/usr/local/bin/service"]
+ENV RUST_LOG=info
+EXPOSE 8080
+
+# Health check (api-gateway exposes /api/health; EHS agents don't bind HTTP)
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -sf http://localhost:8080/api/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/service"]
