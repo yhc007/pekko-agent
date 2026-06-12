@@ -16,3 +16,4 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 jsonwebtoken = { workspace = true }
+parking_lot = "0.12"

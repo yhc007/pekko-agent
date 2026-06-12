@@ -52,6 +52,16 @@ pub struct MetricsRegistry {
     // ── RAG / Vector store ────────────────────────────────────────────────────
     /// rag_searches_total{hit}  — hit=true if docs were retrieved
     pub rag_searches_total:        CounterVec,
+
+    // ── Circuit Breaker ───────────────────────────────────────────────────────
+    /// circuit_breaker_state{provider}  — 0=Closed, 1=Open, 2=HalfOpen
+    pub circuit_breaker_state:         prometheus::GaugeVec,
+    /// circuit_breaker_rejections_total{provider}
+    pub circuit_breaker_rejections:    CounterVec,
+
+    // ── Rate Limiting ─────────────────────────────────────────────────────────
+    /// rate_limit_rejections_total{tenant_id}
+    pub rate_limit_rejections:         CounterVec,
 }
 
 impl MetricsRegistry {
@@ -132,6 +142,26 @@ impl MetricsRegistry {
             &["hit"],
         )?;
 
+        // ── Circuit Breaker ───────────────────────────────────────────────────
+        let circuit_breaker_state = prometheus::GaugeVec::new(
+            Opts::new("circuit_breaker_state",
+                "Circuit breaker state: 0=Closed, 1=Open, 2=HalfOpen"),
+            &["provider"],
+        )?;
+
+        let circuit_breaker_rejections = CounterVec::new(
+            Opts::new("circuit_breaker_rejections_total",
+                "Requests rejected because the circuit breaker is open"),
+            &["provider"],
+        )?;
+
+        // ── Rate Limiting ─────────────────────────────────────────────────────
+        let rate_limit_rejections = CounterVec::new(
+            Opts::new("rate_limit_rejections_total",
+                "Requests rejected by the rate limiter"),
+            &["tenant_id"],
+        )?;
+
         // Register all metrics
         for m in [
             registry.register(Box::new(llm_requests_total.clone())),
@@ -147,6 +177,9 @@ impl MetricsRegistry {
             registry.register(Box::new(workflow_executions_total.clone())),
             registry.register(Box::new(workflow_duration_secs.clone())),
             registry.register(Box::new(rag_searches_total.clone())),
+            registry.register(Box::new(circuit_breaker_state.clone())),
+            registry.register(Box::new(circuit_breaker_rejections.clone())),
+            registry.register(Box::new(rate_limit_rejections.clone())),
         ] {
             m?;
         }
@@ -166,6 +199,9 @@ impl MetricsRegistry {
             workflow_executions_total,
             workflow_duration_secs,
             rag_searches_total,
+            circuit_breaker_state,
+            circuit_breaker_rejections,
+            rate_limit_rejections,
         }))
     }
 

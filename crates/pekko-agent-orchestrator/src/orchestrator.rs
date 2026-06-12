@@ -36,6 +36,7 @@ use pekko_agent_llm::{
     ClaudeClient, GeminiClient, LlmConfig, LlmRequest,
     ClaudeMessage, ContentBlock, ClaudeTool, OpenAIClient,
 };
+use pekko_actor::{CircuitBreaker, CircuitBreakerBuilder, CircuitBreakerError};
 use pekko_agent_memory::{PgConversationStore, PgVectorStore};
 use pekko_agent_observability::MetricsRegistry;
 use pekko_agent_tools::ToolRegistry;
@@ -58,6 +59,8 @@ pub struct OrchestratorDeps {
     pub vector_store:       Option<Arc<PgVectorStore>>,
     /// Optional Prometheus metrics registry.
     pub metrics:            Option<Arc<MetricsRegistry>>,
+    /// Per-provider circuit breakers (key = provider name: "claude", "gemini", "openai").
+    pub circuit_breakers:   HashMap<String, CircuitBreaker>,
 }
 
 // ─── Result type ─────────────────────────────────────────────────────────────
@@ -255,12 +258,13 @@ impl Actor for OrchestratorActor {
                 let prov     = self.deps.llm_provider.clone();
                 let vs       = self.deps.vector_store.clone();
                 let metrics  = self.deps.metrics.clone();
+                let cb       = self.deps.circuit_breakers.get(&self.deps.llm_provider).cloned();
 
                 tokio::spawn(async move {
                     let result = run_query_loop(
                         agent_id, content, session_id, tenant_id, user_id,
                         conv, tools, claude, gemini, openai, cfg, prov,
-                        profile, vs, metrics,
+                        profile, vs, metrics, cb,
                     ).await;
                     let _ = reply_to.send(result);
                 });
@@ -280,12 +284,13 @@ impl Actor for OrchestratorActor {
                 let prov     = self.deps.llm_provider.clone();
                 let vs       = self.deps.vector_store.clone();
                 let metrics  = self.deps.metrics.clone();
+                let cb       = self.deps.circuit_breakers.get(&self.deps.llm_provider).cloned();
 
                 tokio::spawn(async move {
                     run_stream_loop(
                         agent_id, content, session_id, tenant_id, user_id,
                         conv, tools, claude, gemini, openai, cfg, prov,
-                        event_tx, profile, vs, metrics,
+                        event_tx, profile, vs, metrics, cb,
                     ).await;
                 });
                 Box::pin(async {})
@@ -555,6 +560,50 @@ async fn call_llm(
     }
 }
 
+/// Wrapper around `call_llm` that applies a circuit breaker when available.
+/// Also updates CB state metrics.
+async fn call_llm_protected(
+    provider:  &str,
+    request:   &LlmRequest,
+    claude:    &ClaudeClient,
+    gemini:    Option<&GeminiClient>,
+    openai:    Option<&OpenAIClient>,
+    cb:        Option<&CircuitBreaker>,
+    metrics:   Option<&MetricsRegistry>,
+) -> Result<pekko_agent_llm::LlmResponse, String> {
+    if let Some(cb) = cb {
+        let result = cb.call(|| call_llm(provider, request, claude, gemini, openai)).await;
+
+        // Update CB state metric
+        if let Some(m) = metrics {
+            let state_val = match cb.state() {
+                pekko_actor::CircuitBreakerState::Closed   => 0.0,
+                pekko_actor::CircuitBreakerState::Open     => 1.0,
+                pekko_actor::CircuitBreakerState::HalfOpen => 2.0,
+            };
+            m.circuit_breaker_state
+                .with_label_values(&[provider])
+                .set(state_val);
+        }
+
+        result.map_err(|e| match e {
+            CircuitBreakerError::Open => {
+                if let Some(m) = metrics {
+                    m.circuit_breaker_rejections
+                        .with_label_values(&[provider])
+                        .inc();
+                }
+                format!("LLM 회로 차단기 열림 — '{provider}' 공급자가 일시적으로 차단되었습니다")
+            }
+            CircuitBreakerError::Timeout =>
+                format!("LLM 호출 타임아웃 (provider: {provider})"),
+            CircuitBreakerError::CallFailed(e) => e,
+        })
+    } else {
+        call_llm(provider, request, claude, gemini, openai).await
+    }
+}
+
 // ─── Blocking query loop ──────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -574,6 +623,7 @@ async fn run_query_loop(
     profile:      AgentProfile,
     vector_store: Option<Arc<PgVectorStore>>,
     metrics:      Option<Arc<MetricsRegistry>>,
+    cb:           Option<CircuitBreaker>,
 ) -> Result<QueryResult, String> {
     let _query_start = std::time::Instant::now();
     // Persist user message
@@ -649,11 +699,13 @@ async fn run_query_loop(
         };
 
         let llm_start = std::time::Instant::now();
-        let resp = call_llm(
+        let resp = call_llm_protected(
             &provider, &req,
             &claude,
             gemini.as_deref(),
             openai.as_deref(),
+            cb.as_ref(),
+            metrics.as_deref(),
         ).await;
         let llm_elapsed = llm_start.elapsed().as_secs_f64();
 
@@ -842,6 +894,7 @@ async fn run_stream_loop(
     profile:      AgentProfile,
     vector_store: Option<Arc<PgVectorStore>>,
     metrics:      Option<Arc<MetricsRegistry>>,
+    cb:           Option<CircuitBreaker>,
 ) {
     let _ = conv.append_message(&session_id, Message::user(&content)).await;
 
@@ -909,11 +962,13 @@ async fn run_stream_loop(
         };
 
         let llm_start = std::time::Instant::now();
-        let resp = match call_llm(
+        let resp = match call_llm_protected(
             &provider, &req,
             &claude,
             gemini.as_deref(),
             openai.as_deref(),
+            cb.as_ref(),
+            metrics.as_deref(),
         ).await {
             Ok(r) => {
                 let elapsed = llm_start.elapsed().as_secs_f64();
@@ -1118,7 +1173,7 @@ async fn run_workflow_engine(
                 "workflow".to_string(), "system".to_string(),
                 conv.clone(), tools.clone(),
                 claude.clone(), gemini.clone(), openai.clone(),
-                cfg.clone(), provider.clone(), profile, None, None,
+                cfg.clone(), provider.clone(), profile, None, None, None,
             ),
         ).await;
 

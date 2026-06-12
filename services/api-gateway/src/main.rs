@@ -34,7 +34,11 @@ use pekko_agent_orchestrator::{
     Workflow, WorkflowResult,
 };
 use pekko_agent_events::EventPublisher;
-use pekko_agent_security::{AuditLogger, AuditEntry, AuditOutcome, Claims, JwtError, JwtManager, RbacManager};
+use pekko_agent_security::{
+    AuditLogger, AuditEntry, AuditOutcome, Claims, JwtError, JwtManager, RbacManager,
+    RateLimiter, RateLimitConfig,
+};
+use pekko_actor::{CircuitBreaker, CircuitBreakerBuilder};
 use sqlx::PgPool;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -62,6 +66,7 @@ struct AppState {
     api_keys:           Arc<HashMap<String, ApiKeyEntry>>,
     vector_store:       Option<Arc<PgVectorStore>>,
     metrics:            Arc<MetricsRegistry>,
+    rate_limiter:       Arc<RateLimiter>,
 }
 
 // ── JWT extractor ─────────────────────────────────────────────────────────────
@@ -224,6 +229,54 @@ fn forbidden(msg: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
+
+// ── Rate limit middleware ─────────────────────────────────────────────────────
+
+async fn rate_limit_middleware(
+    State(state): State<AppState>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> impl IntoResponse {
+    // Skip rate limiting for public endpoints
+    let path = req.uri().path();
+    if path == "/metrics" || path == "/api/health" || path == "/api/auth/token" {
+        return next.run(req).await.into_response();
+    }
+
+    // Extract claims from Authorization header (best-effort; auth middleware runs later)
+    let (roles, tenant_id) = if let Some(auth_header) = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        match state.jwt_manager.validate(auth_header) {
+            Ok(c) => (c.roles, c.tenant_id),
+            Err(_) => (vec![], "anonymous".to_string()),
+        }
+    } else {
+        (vec![], "anonymous".to_string())
+    };
+
+    if let Err(e) = state.rate_limiter.check(&tenant_id, &roles) {
+        state.metrics.rate_limit_rejections
+            .with_label_values(&[&tenant_id])
+            .inc();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                ("Retry-After", e.retry_after_secs.to_string()),
+                ("X-RateLimit-Limit", e.limit.to_string()),
+            ],
+            Json(ErrorResponse {
+                error: e.to_string(),
+                code: "RATE_LIMIT_EXCEEDED".to_string(),
+            }),
+        ).into_response();
+    }
+
+    next.run(req).await.into_response()
+}
 
 // ── HTTP metrics middleware ────────────────────────────────────────────────────
 
@@ -916,6 +969,55 @@ async fn main() -> anyhow::Result<()> {
     let tool_registry = Arc::new(RwLock::new(tool_registry));
     info!(tools = tool_registry.read().await.list_tools().len(), "Tool registry ready");
 
+    // ── Rate limiter ──────────────────────────────────────────────────────────
+    let rl_config = RateLimitConfig {
+        admin_rpm:   std::env::var("RATE_LIMIT_ADMIN_RPM")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(1000),
+        agent_rpm:   std::env::var("RATE_LIMIT_AGENT_RPM")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(300),
+        default_rpm: std::env::var("RATE_LIMIT_DEFAULT_RPM")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(60),
+    };
+    let rate_limiter = Arc::new(RateLimiter::new(rl_config));
+    info!(
+        admin_rpm = rl_config.admin_rpm,
+        agent_rpm = rl_config.agent_rpm,
+        default_rpm = rl_config.default_rpm,
+        "Rate limiter initialised"
+    );
+
+    // ── Circuit breakers (one per LLM provider) ───────────────────────────────
+    let cb_timeout = Duration::from_secs(
+        std::env::var("CB_CALL_TIMEOUT_SECS")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(30)
+    );
+    let cb_reset = Duration::from_secs(
+        std::env::var("CB_RESET_TIMEOUT_SECS")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(60)
+    );
+    let cb_max_failures: u32 = std::env::var("CB_MAX_FAILURES")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+
+    let make_cb = || {
+        CircuitBreakerBuilder::default()
+            .max_failures(cb_max_failures)
+            .call_timeout(cb_timeout)
+            .reset_timeout(cb_reset)
+            .exponential_backoff(2.0)
+            .build()
+    };
+
+    let mut circuit_breakers = std::collections::HashMap::new();
+    circuit_breakers.insert("claude".to_string(),  make_cb());
+    circuit_breakers.insert("gemini".to_string(),  make_cb());
+    circuit_breakers.insert("openai".to_string(),  make_cb());
+    info!(
+        max_failures = cb_max_failures,
+        call_timeout_secs = cb_timeout.as_secs(),
+        reset_timeout_secs = cb_reset.as_secs(),
+        "Circuit breakers initialised"
+    );
+
     // ── Vector store (long-term memory / RAG) ────────────────────────────────
     let embedder = std::env::var("OPENAI_API_KEY").ok().map(|key| {
         let model = std::env::var("EMBEDDING_MODEL").ok();
@@ -956,6 +1058,7 @@ async fn main() -> anyhow::Result<()> {
         llm_provider,
         vector_store:       vector_store.clone(),
         metrics:            Some(metrics.clone()),
+        circuit_breakers,
     };
 
     let orchestrator_ref = actor_system
@@ -1009,6 +1112,7 @@ async fn main() -> anyhow::Result<()> {
         api_keys,
         vector_store,
         metrics,
+        rate_limiter,
     };
 
     // ── Router ────────────────────────────────────────────────────────────────
@@ -1049,6 +1153,8 @@ async fn main() -> anyhow::Result<()> {
         .merge(public_routes)
         .merge(blocking_protected)
         .merge(streaming_protected)
+        // Rate limiting runs before metrics so rejected requests are still counted
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), http_metrics_middleware))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
