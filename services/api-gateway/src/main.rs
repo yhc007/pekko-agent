@@ -31,6 +31,7 @@ use pekko_agent_llm::EmbeddingClient;
 use pekko_agent_observability::{MetricsRegistry, TracerProvider};
 use pekko_agent_orchestrator::{
     OrchestratorActor, OrchestratorDeps, OrchestratorMessage,
+    OrchestratorPersistence,
     Workflow, WorkflowResult,
 };
 use pekko_agent_events::EventPublisher;
@@ -1045,6 +1046,26 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // ── Orchestrator persistence ──────────────────────────────────────────────
+    let orchestrator_persistence = if std::env::var("DISABLE_ORCHESTRATOR_PERSISTENCE")
+        .map(|v| v == "true").unwrap_or(false)
+    {
+        info!("Orchestrator persistence disabled by DISABLE_ORCHESTRATOR_PERSISTENCE=true");
+        None
+    } else {
+        match OrchestratorPersistence::migrate(&pg_pool).await {
+            Ok(()) => {
+                let store = OrchestratorPersistence::new(pg_pool.clone());
+                info!("OrchestratorPersistence ready");
+                Some(store)
+            }
+            Err(e) => {
+                warn!(error = %e, "Orchestrator persistence migration failed — running without persistence");
+                None
+            }
+        }
+    };
+
     // ── ActorSystem + OrchestratorActor ───────────────────────────────────────
     let actor_system = pekko_actor::ActorSystem::new("pekko-agent");
 
@@ -1059,6 +1080,7 @@ async fn main() -> anyhow::Result<()> {
         vector_store:       vector_store.clone(),
         metrics:            Some(metrics.clone()),
         circuit_breakers,
+        persistence:        orchestrator_persistence,
     };
 
     let orchestrator_ref = actor_system

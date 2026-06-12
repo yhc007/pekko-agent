@@ -43,6 +43,7 @@ use pekko_agent_tools::ToolRegistry;
 
 use crate::workflow::{build_step_content, topological_sort, Workflow, WorkflowResult, WorkflowStatus};
 use crate::saga::SagaManager;
+use crate::persistence::{OrchestratorPersistence, spawn_save_agent, spawn_save_workflow};
 
 // ─── Service dependencies ────────────────────────────────────────────────────
 
@@ -61,6 +62,8 @@ pub struct OrchestratorDeps {
     pub metrics:            Option<Arc<MetricsRegistry>>,
     /// Per-provider circuit breakers (key = provider name: "claude", "gemini", "openai").
     pub circuit_breakers:   HashMap<String, CircuitBreaker>,
+    /// Optional PostgreSQL-backed state persistence.
+    pub persistence:        Option<Arc<OrchestratorPersistence>>,
 }
 
 // ─── Result type ─────────────────────────────────────────────────────────────
@@ -204,6 +207,48 @@ impl Actor for OrchestratorActor {
     fn pre_start(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async {
             info!("OrchestratorActor started in ActorSystem");
+
+            let Some(store) = self.deps.persistence.clone() else { return; };
+
+            // Restore agent registry
+            match store.load_agents().await {
+                Ok(agents) => {
+                    let count = agents.len();
+                    for (info, profile) in agents {
+                        self.agent_profiles.insert(info.agent_id.clone(), profile);
+                        self.agent_registry.insert(info.agent_id.clone(), info);
+                    }
+                    info!(count, "Restored agents from persistence");
+                }
+                Err(e) => warn!(error = %e, "Failed to load agents from persistence"),
+            }
+
+            // Restore workflow history; interrupted Running → Failed
+            match store.load_workflows().await {
+                Ok(mut workflows) => {
+                    let count = workflows.len();
+                    for wf in &mut workflows {
+                        if let WorkflowStatus::Running { current_step } = &wf.status {
+                            let step = *current_step;
+                            wf.status = WorkflowStatus::Failed {
+                                at_step: step,
+                                error: "서버 재시작으로 인해 워크플로우가 중단되었습니다.".to_string(),
+                            };
+                            // Persist the updated (Failed) status back to DB
+                            let wf_clone = wf.clone();
+                            let s = store.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = s.save_workflow(&wf_clone).await {
+                                    warn!(error = %e, "Failed to update interrupted workflow status");
+                                }
+                            });
+                        }
+                        self.workflows.insert(wf.id, wf.clone());
+                    }
+                    info!(count, "Restored workflows from persistence");
+                }
+                Err(e) => warn!(error = %e, "Failed to load workflows from persistence"),
+            }
         })
     }
 
@@ -217,8 +262,11 @@ impl Actor for OrchestratorActor {
         // returned future is 'static and Send.
         match msg {
             OrchestratorMessage::RegisterAgent { info, profile } => {
-                self.agent_profiles.insert(info.agent_id.clone(), profile);
-                self.register_agent(info);
+                self.agent_profiles.insert(info.agent_id.clone(), profile.clone());
+                self.register_agent(info.clone());
+                if let Some(store) = self.deps.persistence.clone() {
+                    spawn_save_agent(store, info, profile);
+                }
                 Box::pin(async {})
             }
             OrchestratorMessage::CreateWorkflow(wf) => {
@@ -307,6 +355,10 @@ impl Actor for OrchestratorActor {
             OrchestratorMessage::ExecuteWorkflow { workflow, reply_to } => {
                 let wf_id = workflow.id;
                 self.workflows.insert(wf_id, workflow.clone());
+                if let Some(store) = self.deps.persistence.clone() {
+                    spawn_save_workflow(store, workflow.clone());
+                }
+                let store   = self.deps.persistence.clone();
                 let profiles = self.agent_profiles.clone();
                 let conv   = self.deps.conversation_store.clone();
                 let tools  = self.deps.tool_registry.clone();
@@ -321,6 +373,14 @@ impl Actor for OrchestratorActor {
                         workflow, conv, tools, claude, gemini, openai, cfg, prov,
                         profiles, None,
                     ).await;
+                    // Persist final status
+                    if let (Some(s), Ok(ref wf_result)) = (store, &result) {
+                        if let Err(e) = s.update_workflow_status(
+                            wf_id, &wf_result.status, None
+                        ).await {
+                            warn!(workflow_id = %wf_id, error = %e, "Failed to update workflow status");
+                        }
+                    }
                     let _ = reply_to.send(result);
                 });
                 Box::pin(async {})
@@ -329,6 +389,10 @@ impl Actor for OrchestratorActor {
             OrchestratorMessage::StreamWorkflow { workflow, event_tx } => {
                 let wf_id = workflow.id;
                 self.workflows.insert(wf_id, workflow.clone());
+                if let Some(store) = self.deps.persistence.clone() {
+                    spawn_save_workflow(store, workflow.clone());
+                }
+                let store   = self.deps.persistence.clone();
                 let profiles = self.agent_profiles.clone();
                 let conv   = self.deps.conversation_store.clone();
                 let tools  = self.deps.tool_registry.clone();
@@ -339,10 +403,17 @@ impl Actor for OrchestratorActor {
                 let prov   = self.deps.llm_provider.clone();
 
                 tokio::spawn(async move {
-                    run_workflow_engine(
+                    let result = run_workflow_engine(
                         workflow, conv, tools, claude, gemini, openai, cfg, prov,
                         profiles, Some(event_tx),
-                    ).await.ok();
+                    ).await;
+                    if let (Some(s), Ok(ref wf_result)) = (store, &result) {
+                        if let Err(e) = s.update_workflow_status(
+                            wf_id, &wf_result.status, None
+                        ).await {
+                            warn!(workflow_id = %wf_id, error = %e, "Failed to update workflow status");
+                        }
+                    }
                 });
                 Box::pin(async {})
             }
