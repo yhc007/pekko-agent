@@ -1,14 +1,25 @@
 use yew::prelude::*;
 
-use crate::types::AgentMeta;
+use crate::types::{AgentMeta, ViewMode};
 
 #[derive(Properties, PartialEq)]
 pub struct HeaderProps {
     pub agent: Option<AgentMeta>,
+    pub view_mode: ViewMode,
 }
 
 #[function_component(ChatHeader)]
 pub fn chat_header(props: &HeaderProps) -> Html {
+    if props.view_mode == ViewMode::Collaborate {
+        return html! {
+            <div class="chat-header">
+                <span style="font-size:20px;">{ "🤝" }</span>
+                <span class="chat-header-title">{ "멀티에이전트 협업" }</span>
+                <span class="chat-header-badge">{ "모든 EHS 에이전트가 협력하여 답변합니다" }</span>
+            </div>
+        };
+    }
+
     if let Some(ref agent) = props.agent {
         html! {
             <div class="chat-header">

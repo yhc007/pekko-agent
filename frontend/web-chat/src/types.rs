@@ -1,6 +1,62 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+// ── Auth API ──
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AuthRequest {
+    pub api_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct AuthResponse {
+    pub token: String,
+    pub token_type: String,
+    pub expires_in: u64,
+    pub tenant_id: String,
+    pub user_id: String,
+    pub roles: Vec<String>,
+}
+
+// ── Collaborate API ──
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CollaborateApiRequest {
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct CollabAgentResponse {
+    pub agent_id: String,
+    pub response: String,
+    pub tools_used: Vec<String>,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct CollaborationResult {
+    pub session_id: Uuid,
+    pub query: String,
+    pub agent_responses: Vec<CollabAgentResponse>,
+    pub synthesis: String,
+    pub total_in_tokens: u32,
+    pub total_out_tokens: u32,
+}
+
+// ── View Mode ──
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ViewMode {
+    SingleAgent,
+    Collaborate,
+}
+
 // ── Query API ──
 
 #[derive(Clone, Debug, Serialize)]
@@ -108,6 +164,7 @@ pub struct ChatMessage {
     pub tools_used: Vec<String>,
     pub token_usage: Option<TokenUsage>,
     pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub collaboration_result: Option<CollaborationResult>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

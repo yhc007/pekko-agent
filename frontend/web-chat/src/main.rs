@@ -11,8 +11,11 @@ use yew::prelude::*;
 
 use components::chat::ChatArea;
 use components::header::ChatHeader;
+use components::login::LoginScreen;
 use components::sidebar::Sidebar;
-use types::{AgentMeta, ChatMessage, MessageRole, StreamEvent, TokenUsage};
+use types::{
+    AgentMeta, AuthResponse, ChatMessage, MessageRole, StreamEvent, TokenUsage, ViewMode,
+};
 
 // Transient state collected while streaming a response
 #[derive(Default)]
@@ -27,7 +30,10 @@ struct StreamState {
 
 #[function_component(App)]
 fn app() -> Html {
-    // ── State ──
+    // ── Auth state ──
+    let auth = use_state(|| Option::<AuthResponse>::None);
+
+    // ── Core state ──
     let agents = use_state(|| AgentMeta::defaults());
     let selected_agent_id = use_state(|| Option::<String>::None);
     let messages = use_state(Vec::<ChatMessage>::new);
@@ -36,6 +42,7 @@ fn app() -> Html {
     let health_status = use_state(|| Option::<String>::None);
     let streaming_status = use_state(|| Option::<String>::None);
     let streaming_text = use_state(|| String::new());
+    let view_mode = use_state(|| ViewMode::SingleAgent);
 
     // ── Health check on mount ──
     {
@@ -51,6 +58,24 @@ fn app() -> Html {
         });
     }
 
+    // ── Login callback ──
+    let on_login = {
+        let auth = auth.clone();
+        Callback::from(move |resp: AuthResponse| {
+            auth.set(Some(resp));
+        })
+    };
+
+    // ── Show login screen if not authenticated ──
+    if auth.is_none() {
+        return html! {
+            <LoginScreen on_login={on_login} />
+        };
+    }
+
+    let auth_info = (*auth).clone().unwrap();
+    let token = auth_info.token.clone();
+
     // ── Callbacks ──
     let on_select_agent = {
         let selected_agent_id = selected_agent_id.clone();
@@ -58,6 +83,17 @@ fn app() -> Html {
         let session_id = session_id.clone();
         Callback::from(move |id: String| {
             selected_agent_id.set(Some(id));
+            messages.set(vec![]);
+            session_id.set(None);
+        })
+    };
+
+    let on_toggle_mode = {
+        let view_mode = view_mode.clone();
+        let messages = messages.clone();
+        let session_id = session_id.clone();
+        Callback::from(move |mode: ViewMode| {
+            view_mode.set(mode);
             messages.set(vec![]);
             session_id.set(None);
         })
@@ -79,12 +115,9 @@ fn app() -> Html {
         let streaming_status = streaming_status.clone();
         let streaming_text = streaming_text.clone();
         let selected_agent_id = selected_agent_id.clone();
+        let view_mode = view_mode.clone();
+        let token = token.clone();
         Callback::from(move |content: String| {
-            let agent_id = match (*selected_agent_id).clone() {
-                Some(id) => id,
-                None => return,
-            };
-
             // Add user message immediately
             let user_msg = ChatMessage {
                 id: Uuid::new_v4().to_string(),
@@ -93,6 +126,7 @@ fn app() -> Html {
                 tools_used: vec![],
                 token_usage: None,
                 timestamp: chrono::Utc::now(),
+                collaboration_result: None,
             };
             let mut new_msgs = (*messages).clone();
             new_msgs.push(user_msg);
@@ -101,138 +135,194 @@ fn app() -> Html {
             streaming_status.set(None);
             streaming_text.set(String::new());
 
-            // Clone handles for async block
             let messages = messages.clone();
             let session_id = session_id.clone();
             let is_loading = is_loading.clone();
             let streaming_status = streaming_status.clone();
             let streaming_text = streaming_text.clone();
             let sid = (*session_id).clone();
+            let current_mode = (*view_mode).clone();
+            let tok = token.clone();
 
-            spawn_local(async move {
-                // Shared mutable state for the streaming callback
-                let stream_state: Rc<RefCell<StreamState>> =
-                    Rc::new(RefCell::new(StreamState::default()));
+            match current_mode {
+                // ── Collaborate mode: fan-out to all agents ──
+                ViewMode::Collaborate => {
+                    spawn_local(async move {
+                        streaming_status.set(Some("여러 에이전트가 분석 중...".into()));
+                        match api::collaborate(&tok, &content, None, sid).await {
+                            Ok(result) => {
+                                let new_sid = result.session_id;
+                                let collab_msg = ChatMessage {
+                                    id: Uuid::new_v4().to_string(),
+                                    role: MessageRole::Assistant,
+                                    content: result.synthesis.clone(),
+                                    tools_used: vec![],
+                                    token_usage: Some(TokenUsage {
+                                        input_tokens: result.total_in_tokens,
+                                        output_tokens: result.total_out_tokens,
+                                    }),
+                                    timestamp: chrono::Utc::now(),
+                                    collaboration_result: Some(result),
+                                };
+                                session_id.set(Some(new_sid));
+                                let mut msgs = (*messages).clone();
+                                msgs.push(collab_msg);
+                                messages.set(msgs);
+                            }
+                            Err(e) => {
+                                let err_msg = ChatMessage {
+                                    id: Uuid::new_v4().to_string(),
+                                    role: MessageRole::System,
+                                    content: format!("협업 오류: {e}"),
+                                    tools_used: vec![],
+                                    token_usage: None,
+                                    timestamp: chrono::Utc::now(),
+                                    collaboration_result: None,
+                                };
+                                let mut msgs = (*messages).clone();
+                                msgs.push(err_msg);
+                                messages.set(msgs);
+                            }
+                        }
+                        streaming_status.set(None);
+                        is_loading.set(false);
+                    });
+                }
 
-                // Clones for the callback (moved in)
-                let ss_cb = stream_state.clone();
-                let st_text_cb = streaming_text.clone();
-                let st_status_cb = streaming_status.clone();
-
-                let result = api::stream_query(
-                    &agent_id,
-                    &content,
-                    sid,
-                    move |event| match event {
-                        StreamEvent::Thinking { round } => {
-                            st_status_cb.set(Some(format!(
-                                "AI 분석 중... ({}회차)",
-                                round + 1
-                            )));
+                // ── Single agent mode: streaming ──
+                ViewMode::SingleAgent => {
+                    let agent_id = match (*selected_agent_id).clone() {
+                        Some(id) => id,
+                        None => {
+                            is_loading.set(false);
+                            return;
                         }
-                        StreamEvent::ToolUse { tool, .. } => {
-                            st_status_cb.set(Some(format!("🔧 {} 실행 중...", tool)));
-                        }
-                        StreamEvent::ToolResult { tool, ok } => {
-                            st_status_cb.set(Some(if ok {
-                                format!("✓ {} 완료", tool)
-                            } else {
-                                format!("✗ {} 실패", tool)
-                            }));
-                        }
-                        StreamEvent::TextChunk { text } => {
-                            let mut s = ss_cb.borrow_mut();
-                            s.accumulated_text.push_str(&text);
-                            st_text_cb.set(s.accumulated_text.clone());
-                            st_status_cb.set(Some("응답 작성 중...".into()));
-                        }
-                        StreamEvent::Done {
-                            session_id: sid,
-                            tools_used,
-                            input_tokens,
-                            output_tokens,
-                        } => {
-                            let mut s = ss_cb.borrow_mut();
-                            s.session_id = Some(sid);
-                            s.tools_used = tools_used;
-                            s.input_tokens = input_tokens;
-                            s.output_tokens = output_tokens;
-                        }
-                        StreamEvent::Error { message } => {
-                            ss_cb.borrow_mut().error = Some(message);
-                        }
-                    },
-                )
-                .await;
-
-                // Stream ended — clear transient UI state
-                streaming_text.set(String::new());
-                streaming_status.set(None);
-                is_loading.set(false);
-
-                // Handle transport error (network/parse failures)
-                if let Err(e) = result {
-                    let err_msg = ChatMessage {
-                        id: Uuid::new_v4().to_string(),
-                        role: MessageRole::System,
-                        content: format!("네트워크 오류: {e}"),
-                        tools_used: vec![],
-                        token_usage: None,
-                        timestamp: chrono::Utc::now(),
                     };
-                    let mut msgs = (*messages).clone();
-                    msgs.push(err_msg);
-                    messages.set(msgs);
-                    return;
+
+                    spawn_local(async move {
+                        let stream_state: Rc<RefCell<StreamState>> =
+                            Rc::new(RefCell::new(StreamState::default()));
+
+                        let ss_cb = stream_state.clone();
+                        let st_text_cb = streaming_text.clone();
+                        let st_status_cb = streaming_status.clone();
+
+                        let result = api::stream_query(
+                            &agent_id,
+                            &content,
+                            sid,
+                            Some(tok),
+                            move |event| match event {
+                                StreamEvent::Thinking { round } => {
+                                    st_status_cb.set(Some(format!(
+                                        "AI 분석 중... ({}회차)", round + 1
+                                    )));
+                                }
+                                StreamEvent::ToolUse { tool, .. } => {
+                                    st_status_cb.set(Some(format!("🔧 {} 실행 중...", tool)));
+                                }
+                                StreamEvent::ToolResult { tool, ok } => {
+                                    st_status_cb.set(Some(if ok {
+                                        format!("✓ {} 완료", tool)
+                                    } else {
+                                        format!("✗ {} 실패", tool)
+                                    }));
+                                }
+                                StreamEvent::TextChunk { text } => {
+                                    let mut s = ss_cb.borrow_mut();
+                                    s.accumulated_text.push_str(&text);
+                                    st_text_cb.set(s.accumulated_text.clone());
+                                    st_status_cb.set(Some("응답 작성 중...".into()));
+                                }
+                                StreamEvent::Done {
+                                    session_id: sid,
+                                    tools_used,
+                                    input_tokens,
+                                    output_tokens,
+                                } => {
+                                    let mut s = ss_cb.borrow_mut();
+                                    s.session_id = Some(sid);
+                                    s.tools_used = tools_used;
+                                    s.input_tokens = input_tokens;
+                                    s.output_tokens = output_tokens;
+                                }
+                                StreamEvent::Error { message } => {
+                                    ss_cb.borrow_mut().error = Some(message);
+                                }
+                            },
+                        )
+                        .await;
+
+                        streaming_text.set(String::new());
+                        streaming_status.set(None);
+                        is_loading.set(false);
+
+                        if let Err(e) = result {
+                            let err_msg = ChatMessage {
+                                id: Uuid::new_v4().to_string(),
+                                role: MessageRole::System,
+                                content: format!("네트워크 오류: {e}"),
+                                tools_used: vec![],
+                                token_usage: None,
+                                timestamp: chrono::Utc::now(),
+                                collaboration_result: None,
+                            };
+                            let mut msgs = (*messages).clone();
+                            msgs.push(err_msg);
+                            messages.set(msgs);
+                            return;
+                        }
+
+                        let state = stream_state.borrow();
+
+                        if let Some(ref err) = state.error {
+                            let err_msg = ChatMessage {
+                                id: Uuid::new_v4().to_string(),
+                                role: MessageRole::System,
+                                content: format!("오류: {err}"),
+                                tools_used: vec![],
+                                token_usage: None,
+                                timestamp: chrono::Utc::now(),
+                                collaboration_result: None,
+                            };
+                            let mut msgs = (*messages).clone();
+                            msgs.push(err_msg);
+                            messages.set(msgs);
+                            return;
+                        }
+
+                        if let Some(sid) = state.session_id {
+                            session_id.set(Some(sid));
+                        }
+
+                        let assistant_msg = ChatMessage {
+                            id: Uuid::new_v4().to_string(),
+                            role: MessageRole::Assistant,
+                            content: state.accumulated_text.clone(),
+                            tools_used: state.tools_used.clone(),
+                            token_usage: Some(TokenUsage {
+                                input_tokens: state.input_tokens,
+                                output_tokens: state.output_tokens,
+                            }),
+                            timestamp: chrono::Utc::now(),
+                            collaboration_result: None,
+                        };
+                        let mut msgs = (*messages).clone();
+                        msgs.push(assistant_msg);
+                        messages.set(msgs);
+                    });
                 }
-
-                let state = stream_state.borrow();
-
-                // Handle application-level error from the stream
-                if let Some(ref err) = state.error {
-                    let err_msg = ChatMessage {
-                        id: Uuid::new_v4().to_string(),
-                        role: MessageRole::System,
-                        content: format!("오류: {err}"),
-                        tools_used: vec![],
-                        token_usage: None,
-                        timestamp: chrono::Utc::now(),
-                    };
-                    let mut msgs = (*messages).clone();
-                    msgs.push(err_msg);
-                    messages.set(msgs);
-                    return;
-                }
-
-                // Success — persist session_id and add final message
-                if let Some(sid) = state.session_id {
-                    session_id.set(Some(sid));
-                }
-
-                let assistant_msg = ChatMessage {
-                    id: Uuid::new_v4().to_string(),
-                    role: MessageRole::Assistant,
-                    content: state.accumulated_text.clone(),
-                    tools_used: state.tools_used.clone(),
-                    token_usage: Some(TokenUsage {
-                        input_tokens: state.input_tokens,
-                        output_tokens: state.output_tokens,
-                    }),
-                    timestamp: chrono::Utc::now(),
-                };
-                let mut msgs = (*messages).clone();
-                msgs.push(assistant_msg);
-                messages.set(msgs);
-            });
+            }
         })
     };
 
     let on_example_click = on_send.clone();
 
-    // ── Resolve selected agent meta ──
     let selected_meta = (*selected_agent_id).as_ref().and_then(|id| {
         agents.iter().find(|a| a.id == *id).cloned()
     });
+
+    let has_agent = (*view_mode) == ViewMode::Collaborate || selected_meta.is_some();
 
     html! {
         <>
@@ -242,17 +332,21 @@ fn app() -> Html {
                 on_select_agent={on_select_agent}
                 on_new_chat={on_new_chat}
                 health_status={(*health_status).clone()}
+                view_mode={(*view_mode).clone()}
+                on_toggle_mode={on_toggle_mode}
+                user_id={auth_info.user_id.clone()}
             />
             <div class="main">
-                <ChatHeader agent={selected_meta.clone()} />
+                <ChatHeader agent={selected_meta.clone()} view_mode={(*view_mode).clone()} />
                 <ChatArea
                     messages={(*messages).clone()}
+                    agents={(*agents).clone()}
                     is_loading={*is_loading}
                     streaming_status={(*streaming_status).clone()}
                     streaming_text={(*streaming_text).clone()}
                     on_send={on_send}
                     on_example_click={on_example_click}
-                    has_agent={selected_meta.is_some()}
+                    has_agent={has_agent}
                 />
             </div>
         </>

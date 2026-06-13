@@ -1,14 +1,16 @@
 use web_sys::{Element, ScrollBehavior, ScrollIntoViewOptions};
 use yew::prelude::*;
 
+use crate::components::collaborate::CollaborateResultView;
 use crate::components::input::ChatInput;
 use crate::components::message::{MessageBubble, TypingIndicator};
 use crate::markdown;
-use crate::types::ChatMessage;
+use crate::types::{AgentMeta, ChatMessage};
 
 #[derive(Properties, PartialEq)]
 pub struct ChatProps {
     pub messages: Vec<ChatMessage>,
+    pub agents: Vec<AgentMeta>,
     pub is_loading: bool,
     #[prop_or_default]
     pub streaming_status: Option<String>,
@@ -114,8 +116,17 @@ pub fn chat_area(props: &ChatProps) -> Html {
         html! {
             <>
                 <div class="messages">
-                    { for props.messages.iter().map(|msg| html! {
-                        <MessageBubble message={msg.clone()} />
+                    { for props.messages.iter().map(|msg| {
+                        if let Some(ref result) = msg.collaboration_result {
+                            html! {
+                                <CollaborateResultView
+                                    result={result.clone()}
+                                    agents={props.agents.clone()}
+                                />
+                            }
+                        } else {
+                            html! { <MessageBubble message={msg.clone()} /> }
+                        }
                     })}
                     { streaming_bubble }
                     { loading_indicator }

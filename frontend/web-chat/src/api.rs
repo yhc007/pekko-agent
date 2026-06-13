@@ -7,6 +7,10 @@ use crate::types::*;
 
 const DEFAULT_BASE_URL: &str = "http://localhost:8080";
 
+fn auth_header(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
 fn base_url() -> String {
     // Dynamically determine API URL based on current location
     if let Some(window) = web_sys::window() {
@@ -19,6 +23,54 @@ fn base_url() -> String {
     }
     // Fallback to localhost for development
     DEFAULT_BASE_URL.to_string()
+}
+
+/// POST /api/auth/token — exchange API key for JWT
+pub async fn issue_token(api_key: &str) -> Result<AuthResponse, String> {
+    let url = format!("{}/api/auth/token", base_url());
+    let body = AuthRequest { api_key: api_key.to_string() };
+    let resp = Request::post(&url)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .map_err(|e| format!("직렬화 오류: {e}"))?
+        .send()
+        .await
+        .map_err(|e| format!("네트워크 오류: {e}"))?;
+    if resp.ok() {
+        resp.json::<AuthResponse>().await.map_err(|e| format!("파싱 오류: {e}"))
+    } else {
+        let err = resp.json::<ErrorResponse>().await
+            .map(|e| e.error)
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status()));
+        Err(err)
+    }
+}
+
+/// POST /api/agents/collaborate — fan-out to all agents, returns synthesised result
+pub async fn collaborate(
+    token: &str,
+    content: &str,
+    agent_ids: Option<Vec<String>>,
+    session_id: Option<Uuid>,
+) -> Result<CollaborationResult, String> {
+    let url = format!("{}/api/agents/collaborate", base_url());
+    let body = CollaborateApiRequest { content: content.to_string(), agent_ids, session_id };
+    let resp = Request::post(&url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", &auth_header(token))
+        .json(&body)
+        .map_err(|e| format!("직렬화 오류: {e}"))?
+        .send()
+        .await
+        .map_err(|e| format!("네트워크 오류: {e}"))?;
+    if resp.ok() {
+        resp.json::<CollaborationResult>().await.map_err(|e| format!("파싱 오류: {e}"))
+    } else {
+        let err = resp.json::<ErrorResponse>().await
+            .map(|e| e.error)
+            .unwrap_or_else(|_| format!("HTTP {}", resp.status()));
+        Err(err)
+    }
 }
 
 /// GET /api/health
@@ -104,6 +156,7 @@ pub async fn stream_query<F: FnMut(StreamEvent)>(
     agent_id: &str,
     content: &str,
     session_id: Option<Uuid>,
+    token: Option<String>,
     mut on_event: F,
 ) -> Result<(), String> {
     let url = format!("{}/api/agents/{}/query/stream", base_url(), agent_id);
@@ -120,6 +173,10 @@ pub async fn stream_query<F: FnMut(StreamEvent)>(
         .map_err(|e| format!("Headers 오류: {:?}", e))?;
     headers.append("Content-Type", "application/json")
         .map_err(|e| format!("Header 설정 오류: {:?}", e))?;
+    if let Some(t) = token {
+        headers.append("Authorization", &auth_header(&t))
+            .map_err(|e| format!("Header 설정 오류: {:?}", e))?;
+    }
 
     let opts = web_sys::RequestInit::new();
     opts.set_method("POST");

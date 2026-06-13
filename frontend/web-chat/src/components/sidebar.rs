@@ -1,6 +1,6 @@
 use yew::prelude::*;
 
-use crate::types::AgentMeta;
+use crate::types::{AgentMeta, ViewMode};
 
 #[derive(Properties, PartialEq)]
 pub struct SidebarProps {
@@ -9,6 +9,9 @@ pub struct SidebarProps {
     pub on_select_agent: Callback<String>,
     pub on_new_chat: Callback<()>,
     pub health_status: Option<String>,
+    pub view_mode: ViewMode,
+    pub on_toggle_mode: Callback<ViewMode>,
+    pub user_id: String,
 }
 
 #[function_component(Sidebar)]
@@ -24,6 +27,17 @@ pub fn sidebar(props: &SidebarProps) -> Html {
         None => "연결 확인 중...",
     };
 
+    let is_collab = props.view_mode == ViewMode::Collaborate;
+
+    let on_single = {
+        let cb = props.on_toggle_mode.clone();
+        Callback::from(move |_: MouseEvent| cb.emit(ViewMode::SingleAgent))
+    };
+    let on_collab = {
+        let cb = props.on_toggle_mode.clone();
+        Callback::from(move |_: MouseEvent| cb.emit(ViewMode::Collaborate))
+    };
+
     html! {
         <div class="sidebar">
             // ── Header ──
@@ -32,35 +46,61 @@ pub fn sidebar(props: &SidebarProps) -> Html {
                     <span class="dot"></span>
                     { "Pekko Agent" }
                 </h1>
-                <p>{ "EHS 안전보건환경 AI" }</p>
+                <p>{ format!("EHS 안전보건환경 AI · {}", props.user_id) }</p>
             </div>
 
-            // ── Agents ──
+            // ── Mode Toggle ──
             <div class="sidebar-section">
-                <div class="sidebar-section-title">{ "에이전트" }</div>
-                { for props.agents.iter().map(|agent| {
-                    let is_active = props.selected_agent.as_ref() == Some(&agent.id);
-                    let agent_id = agent.id.clone();
-                    let on_click = {
-                        let cb = props.on_select_agent.clone();
-                        Callback::from(move |_: MouseEvent| cb.emit(agent_id.clone()))
-                    };
-                    html! {
-                        <div
-                            class={classes!("agent-item", is_active.then_some("active"))}
-                            onclick={on_click}
-                        >
-                            <div class={classes!("agent-icon", agent.css_class.to_string())}>
-                                { agent.icon }
-                            </div>
-                            <div>
-                                <div class="agent-name">{ &agent.name }</div>
-                                <div class="agent-desc">{ &agent.description }</div>
-                            </div>
-                        </div>
-                    }
-                })}
+                <div class="sidebar-section-title">{ "모드" }</div>
+                <div
+                    class={classes!("agent-item", (!is_collab).then_some("active"))}
+                    onclick={on_single}
+                >
+                    <div class="mode-icon">{ "🤖" }</div>
+                    <div>
+                        <div class="agent-name">{ "단일 에이전트" }</div>
+                    </div>
+                </div>
+                <div
+                    class={classes!("agent-item", is_collab.then_some("active"))}
+                    onclick={on_collab}
+                >
+                    <div class="mode-icon">{ "🤝" }</div>
+                    <div>
+                        <div class="agent-name">{ "협업 모드" }</div>
+                        <div class="agent-desc">{ "모든 에이전트 협업" }</div>
+                    </div>
+                </div>
             </div>
+
+            // ── Agents (shown when single mode) ──
+            if !is_collab {
+                <div class="sidebar-section">
+                    <div class="sidebar-section-title">{ "에이전트" }</div>
+                    { for props.agents.iter().map(|agent| {
+                        let is_active = props.selected_agent.as_ref() == Some(&agent.id);
+                        let agent_id = agent.id.clone();
+                        let on_click = {
+                            let cb = props.on_select_agent.clone();
+                            Callback::from(move |_: MouseEvent| cb.emit(agent_id.clone()))
+                        };
+                        html! {
+                            <div
+                                class={classes!("agent-item", is_active.then_some("active"))}
+                                onclick={on_click}
+                            >
+                                <div class={classes!("agent-icon", agent.css_class.to_string())}>
+                                    { agent.icon }
+                                </div>
+                                <div>
+                                    <div class="agent-name">{ &agent.name }</div>
+                                    <div class="agent-desc">{ &agent.description }</div>
+                                </div>
+                            </div>
+                        }
+                    })}
+                </div>
+            }
 
             // ── New chat button ──
             <div class="sidebar-section">
