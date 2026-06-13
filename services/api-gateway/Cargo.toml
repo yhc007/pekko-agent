@@ -29,3 +29,9 @@ pekko-actor.workspace = true
 dotenvy.workspace = true
 sqlx.workspace = true
 futures.workspace = true
+tonic.workspace = true
+prost.workspace = true
+tokio-stream = "0.1"
+
+[build-dependencies]
+tonic-build = "0.12"

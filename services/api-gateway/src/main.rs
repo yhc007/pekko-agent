@@ -1,3 +1,5 @@
+mod grpc;
+
 use axum::{
     async_trait,
     extract::{FromRequestParts, Path, State, Json},
@@ -49,27 +51,27 @@ const BLOCKING_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ── API key entry (replaces a user-store for now) ─────────────────────────────
 #[derive(Clone)]
-struct ApiKeyEntry {
-    user_id:   String,
-    tenant_id: String,
-    roles:     Vec<String>,
+pub(crate) struct ApiKeyEntry {
+    pub(crate) user_id:   String,
+    pub(crate) tenant_id: String,
+    pub(crate) roles:     Vec<String>,
 }
 
 // ── Shared application state ──────────────────────────────────────────────────
 #[derive(Clone)]
-struct AppState {
-    tool_registry:      Arc<RwLock<ToolRegistry>>,
-    conversation_store: Arc<PgConversationStore>,
-    orchestrator_ref:   ActorRef<OrchestratorActor>,
-    event_publisher:    Arc<EventPublisher>,
-    audit_logger:       Arc<AuditLogger>,
-    jwt_manager:        Arc<JwtManager>,
-    rbac:               Arc<RwLock<RbacManager>>,
+pub(crate) struct AppState {
+    pub(crate) tool_registry:      Arc<RwLock<ToolRegistry>>,
+    pub(crate) conversation_store: Arc<PgConversationStore>,
+    pub(crate) orchestrator_ref:   ActorRef<OrchestratorActor>,
+    pub(crate) event_publisher:    Arc<EventPublisher>,
+    pub(crate) audit_logger:       Arc<AuditLogger>,
+    pub(crate) jwt_manager:        Arc<JwtManager>,
+    pub(crate) rbac:               Arc<RwLock<RbacManager>>,
     /// API-key → user identity map.  Keyed by the raw key string.
-    api_keys:           Arc<HashMap<String, ApiKeyEntry>>,
-    vector_store:       Option<Arc<PgVectorStore>>,
-    metrics:            Arc<MetricsRegistry>,
-    rate_limiter:       Arc<RateLimiter>,
+    pub(crate) api_keys:           Arc<HashMap<String, ApiKeyEntry>>,
+    pub(crate) vector_store:       Option<Arc<PgVectorStore>>,
+    pub(crate) metrics:            Arc<MetricsRegistry>,
+    pub(crate) rate_limiter:       Arc<RateLimiter>,
 }
 
 // ── JWT extractor ─────────────────────────────────────────────────────────────
@@ -1524,6 +1526,9 @@ async fn main() -> anyhow::Result<()> {
     let port: u16 = std::env::var("API_GATEWAY_PORT")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(8080);
 
+    // Clone state for gRPC before moving it into the HTTP router
+    let grpc_state = state.clone();
+
     let app = Router::new()
         .merge(public_routes)
         .merge(blocking_protected)
@@ -1537,10 +1542,29 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!(%addr, "API Gateway listening");
+    info!(%addr, "API Gateway HTTP listening");
+
+    // ── gRPC server (runs alongside HTTP on GRPC_PORT, default 50051) ─────────
+    let grpc_port: u16 = std::env::var("GRPC_PORT")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(50051);
+    let grpc_addr: std::net::SocketAddr = format!("0.0.0.0:{grpc_port}").parse()?;
+    info!(%grpc_addr, "API Gateway gRPC listening");
+
+    let grpc_handle = tokio::spawn(async move {
+        if let Err(e) = tonic::transport::Server::builder()
+            .add_service(grpc::service(grpc_state))
+            .serve(grpc_addr)
+            .await
+        {
+            error!(error = %e, "gRPC server error");
+        }
+    });
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            grpc_handle.abort();
+        })
         .await?;
 
     Ok(())
@@ -1548,6 +1572,6 @@ async fn main() -> anyhow::Result<()> {
 
 async fn shutdown_signal() {
     tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl+c");
-    info!("Graceful shutdown");
-    // OTel flush is handled by _otel_provider drop at end of main()
+    info!("Graceful shutdown — flushing OTel spans");
+    // _otel_provider drops here, triggering TracerProvider::shutdown via Drop
 }

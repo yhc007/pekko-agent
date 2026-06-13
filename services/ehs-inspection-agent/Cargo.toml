@@ -26,3 +26,4 @@ pekko-persistence.workspace = true
 axum.workspace = true
 reqwest = { workspace = true }
 dotenvy.workspace = true
+pekko-agent-observability = { path = "../../crates/pekko-agent-observability" }

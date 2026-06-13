@@ -64,9 +64,11 @@ services:
         SERVICE: api-gateway
     ports:
       - "${API_GATEWAY_PORT:-8080}:8080"
+      - "${GRPC_PORT:-50051}:50051"
     environment:
       <<: *agent-env
       API_GATEWAY_PORT: "8080"
+      GRPC_PORT: "50051"
       OTLP_ENDPOINT: ${OTLP_ENDPOINT:-}
     depends_on:
       postgres:

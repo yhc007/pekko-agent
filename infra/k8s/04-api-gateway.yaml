@@ -35,6 +35,8 @@ spec:
           ports:
             - containerPort: 8080
               name: http
+            - containerPort: 50051
+              name: grpc
           envFrom:
             - configMapRef:
                 name: pekko-agent-config
@@ -115,6 +117,9 @@ spec:
     - name: http
       port: 8080
       targetPort: 8080
+    - name: grpc
+      port: 50051
+      targetPort: 50051
   type: ClusterIP
 
 ---

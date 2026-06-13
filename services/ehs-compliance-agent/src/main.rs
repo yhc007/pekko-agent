@@ -81,9 +81,7 @@ async fn health() -> Json<HealthResponse> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
-        .json().init();
+    let _otel = pekko_agent_observability::tracing::init("ehs-compliance-agent");
 
     let gateway_url = std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
     let api_key     = std::env::var("AGENT_API_KEY").unwrap_or_else(|_| { warn!("AGENT_API_KEY not set"); String::new() });
@@ -97,8 +95,12 @@ async fn main() -> anyhow::Result<()> {
     info!(addr = %format!("0.0.0.0:{port}"), "EHS Compliance Agent listening");
 
     axum::serve(listener, Router::new().route("/health", get(health)))
-        .with_graceful_shutdown(async { tokio::signal::ctrl_c().await.ok(); })
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c().await.ok();
+            info!("EHS Compliance Agent shutting down");
+        })
         .await?;
 
+    pekko_agent_observability::tracing::shutdown(_otel);
     Ok(())
 }
