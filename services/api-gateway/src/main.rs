@@ -1,4 +1,5 @@
 mod grpc;
+mod openapi;
 
 use axum::{
     async_trait,
@@ -20,6 +21,7 @@ use std::time::Duration;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use futures::stream;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 use uuid::Uuid;
 use tracing::{info, warn, error};
 
@@ -135,7 +137,7 @@ async fn require_permission(
 // ── Request / Response types ──────────────────────────────────────────────────
 
 /// POST /api/auth/token
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct AuthRequest {
     api_key:   String,
     /// Optional override; defaults to the key's registered tenant.
@@ -143,7 +145,7 @@ struct AuthRequest {
     tenant_id: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct AuthResponse {
     token:      String,
     token_type: &'static str,
@@ -153,7 +155,7 @@ struct AuthResponse {
     roles:      Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct QueryRequest {
     content: String,
     #[serde(default)]
@@ -178,30 +180,31 @@ struct WsQueryRequest {
 fn default_tenant() -> String { "default".to_string() }
 fn default_user()   -> String { "anonymous".to_string() }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct QueryResponse {
     session_id:  Uuid,
     agent_id:    String,
     response:    String,
     tools_used:  Vec<String>,
+    #[schema(value_type = openapi::TokenUsageDoc)]
     token_usage: TokenUsage,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct HealthResponse {
     status:   String,
     version:  String,
     services: ServiceStatus,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct ServiceStatus {
     orchestrator:     String,
     tools_registered: usize,
     active_agents:    usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct ErrorResponse {
     error: String,
     code:  String,
@@ -371,6 +374,13 @@ async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse 
 }
 
 /// GET /api/health  — public, no auth required
+#[utoipa::path(
+    get, path = "/api/health",
+    tag = "system",
+    responses(
+        (status = 200, description = "Service is healthy", body = HealthResponse),
+    )
+)]
 async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     let tool_count = state.tool_registry.read().await.list_tools().len();
 
@@ -396,6 +406,15 @@ async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// POST /api/auth/token  — public; exchange API key for a JWT
+#[utoipa::path(
+    post, path = "/api/auth/token",
+    tag = "auth",
+    request_body = AuthRequest,
+    responses(
+        (status = 200, description = "JWT issued", body = AuthResponse),
+        (status = 401, description = "Invalid API key", body = ErrorResponse),
+    )
+)]
 async fn issue_token(
     State(state): State<AppState>,
     Json(req):    Json<AuthRequest>,
@@ -423,6 +442,15 @@ async fn issue_token(
 }
 
 /// GET /api/agents  — requires memory.read
+#[utoipa::path(
+    get, path = "/api/agents",
+    tag = "agents",
+    responses(
+        (status = 200, description = "List of registered agents", body = Vec<openapi::AgentInfoDoc>),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_agents(
     auth:         AuthUser,
     State(state): State<AppState>,
@@ -439,6 +467,19 @@ async fn list_agents(
 }
 
 /// POST /api/agents/:agent_id/query  — requires agent.delegate
+#[utoipa::path(
+    post, path = "/api/agents/{agent_id}/query",
+    tag = "agents",
+    params(("agent_id" = String, Path, description = "Target agent ID")),
+    request_body = QueryRequest,
+    responses(
+        (status = 200, description = "Query result", body = QueryResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Insufficient permissions", body = ErrorResponse),
+        (status = 503, description = "Agent unavailable", body = ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn query_agent(
     auth:           AuthUser,
     Path(agent_id): Path<String>,
@@ -521,6 +562,18 @@ async fn query_agent(
 }
 
 /// POST /api/agents/:agent_id/query/stream  — requires agent.delegate, SSE
+#[utoipa::path(
+    post, path = "/api/agents/{agent_id}/query/stream",
+    tag = "agents",
+    params(("agent_id" = String, Path, description = "Target agent ID")),
+    request_body = QueryRequest,
+    responses(
+        (status = 200, description = "Server-Sent Events stream of agent reasoning chunks",
+         content_type = "text/event-stream"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn stream_query_agent(
     auth:           AuthUser,
     Path(agent_id): Path<String>,
@@ -663,6 +716,16 @@ async fn ws_agent_handler(
 }
 
 /// GET /api/sessions/:session_id/history  — requires memory.read
+#[utoipa::path(
+    get, path = "/api/sessions/{session_id}/history",
+    tag = "agents",
+    params(("session_id" = String, Path, description = "Session UUID")),
+    responses(
+        (status = 200, description = "Conversation message history (JSON array)"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_session_history(
     auth:              AuthUser,
     Path(session_id):  Path<Uuid>,
@@ -678,6 +741,15 @@ async fn get_session_history(
 }
 
 /// GET /api/tools  — requires memory.read
+#[utoipa::path(
+    get, path = "/api/tools",
+    tag = "agents",
+    responses(
+        (status = 200, description = "Registered tool definitions (JSON array)"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_tools(
     auth:         AuthUser,
     State(state): State<AppState>,
@@ -690,7 +762,7 @@ async fn list_tools(
 
 // ── Long-term memory (vector store) endpoints ────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct MemoryStoreRequest {
     id:       Option<String>,
     content:  String,
@@ -698,13 +770,14 @@ struct MemoryStoreRequest {
     #[serde(default = "default_tenant")]
     agent_id: String,
     #[serde(default)]
+    #[schema(value_type = Object)]
     metadata: std::collections::HashMap<String, String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct MemoryStoreResponse { doc_id: String }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct MemorySearchRequest {
     query: String,
     #[serde(default = "default_top_k")]
@@ -713,6 +786,17 @@ struct MemorySearchRequest {
 fn default_top_k() -> usize { 5 }
 
 /// POST /api/memory/store  — requires admin.all
+#[utoipa::path(
+    post, path = "/api/memory/store",
+    tag = "memory",
+    request_body = MemoryStoreRequest,
+    responses(
+        (status = 200, description = "Document stored", body = MemoryStoreResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 503, description = "Vector store not configured", body = ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn memory_store(
     auth:         AuthUser,
     State(state): State<AppState>,
@@ -739,6 +823,17 @@ async fn memory_store(
 }
 
 /// POST /api/memory/search  — requires agent.delegate
+#[utoipa::path(
+    post, path = "/api/memory/search",
+    tag = "memory",
+    request_body = MemorySearchRequest,
+    responses(
+        (status = 200, description = "Matching memory documents", body = Vec<openapi::MemoryDocumentDoc>),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 503, description = "Vector store not configured", body = ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn memory_search(
     auth:         AuthUser,
     State(state): State<AppState>,
@@ -758,6 +853,17 @@ async fn memory_search(
 }
 
 /// DELETE /api/memory/:doc_id  — requires admin.all
+#[utoipa::path(
+    delete, path = "/api/memory/{doc_id}",
+    tag = "memory",
+    params(("doc_id" = String, Path, description = "Document ID to delete")),
+    responses(
+        (status = 204, description = "Document deleted"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Document not found", body = ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn memory_delete(
     auth:           AuthUser,
     Path(doc_id):   Path<String>,
@@ -902,6 +1008,7 @@ async fn get_workflow_status(
 // ── Multi-agent collaboration endpoints ───────────────────────────────────────
 
 #[derive(Deserialize)]
+#[derive(ToSchema)]
 struct CollaborateRequest {
     content:    String,
     /// Explicit list of agent IDs to involve. Omit to use all registered agents.
@@ -913,6 +1020,18 @@ struct CollaborateRequest {
 ///
 /// Fans out the query to multiple agents in parallel, then synthesises
 /// their responses into a single coherent answer.
+#[utoipa::path(
+    post, path = "/api/agents/collaborate",
+    tag = "collaborate",
+    request_body = CollaborateRequest,
+    responses(
+        (status = 200, description = "Collaboration result with per-agent responses and synthesis",
+         body = openapi::CollaborationResultDoc),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 503, description = "Orchestrator unavailable", body = ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn collaborate_agents(
     auth:         AuthUser,
     State(state): State<AppState>,
@@ -1169,6 +1288,19 @@ async fn stream_events(
 }
 
 /// GET /api/events/history  — recent event history (ring buffer)
+#[utoipa::path(
+    get, path = "/api/events/history",
+    tag = "events",
+    params(
+        ("limit"  = Option<usize>, Query, description = "Max events to return (default 50)"),
+        ("tenant" = Option<String>, Query, description = "Filter by tenant ID"),
+    ),
+    responses(
+        (status = 200, description = "Recent system events (JSON array)"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn event_history(
     auth:                    AuthUser,
     State(state):            State<AppState>,
@@ -1184,9 +1316,11 @@ async fn event_history(
 
 // ── Agent registration endpoint ───────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct AgentRegistrationRequest {
+    #[schema(value_type = openapi::AgentInfoDoc)]
     info:    AgentInfo,
+    #[schema(value_type = openapi::AgentProfileDoc)]
     profile: AgentProfile,
 }
 
@@ -1194,6 +1328,17 @@ struct AgentRegistrationRequest {
 ///
 /// Called by EHS microservices at startup to register their AgentInfo
 /// and declare their tool whitelist / token limits.
+#[utoipa::path(
+    post, path = "/api/agents/register",
+    tag = "agents",
+    request_body = AgentRegistrationRequest,
+    responses(
+        (status = 204, description = "Agent registered"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Requires admin role", body = ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn register_agent(
     auth:         AuthUser,
     State(state): State<AppState>,
@@ -1559,6 +1704,9 @@ async fn main() -> anyhow::Result<()> {
             error!(error = %e, "gRPC server error");
         }
     });
+
+    // Swagger UI + raw spec (stateless, merged after with_state)
+    let app = app.merge(openapi::swagger_routes());
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {

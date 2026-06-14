@@ -46,6 +46,11 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install protoc (required by api-gateway gRPC build.rs)
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
@@ -66,6 +71,11 @@ jobs:
         with:
           components: clippy
 
+      - name: Install protoc (required by api-gateway gRPC build.rs)
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
@@ -79,6 +89,15 @@ jobs:
             -p pekko-agent-memory \
             -p pekko-agent-tools \
             -- -W clippy::all
+
+      - name: Run clippy (service binaries)
+        run: |
+          cargo clippy \
+            -p api-gateway \
+            -p ehs-permit-agent \
+            -p ehs-inspection-agent \
+            -p ehs-compliance-agent \
+            -- -W clippy::all -A clippy::too_many_arguments
 
   # ── Docker Build Smoke Test ───────────────────────────────────────────────
   docker-build:

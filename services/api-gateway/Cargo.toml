@@ -32,6 +32,8 @@ futures.workspace = true
 tonic.workspace = true
 prost.workspace = true
 tokio-stream = "0.1"
+utoipa = { version = "4", features = ["uuid", "chrono"] }
+utoipa-swagger-ui = { version = "7", features = ["axum"] }
 
 [build-dependencies]
 tonic-build = "0.12"
