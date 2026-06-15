@@ -14,7 +14,8 @@ pekko-agent-orchestrator = { path = "../../crates/pekko-agent-orchestrator" }
 pekko-agent-events = { path = "../../crates/pekko-agent-events" }
 pekko-agent-security = { path = "../../crates/pekko-agent-security" }
 pekko-agent-observability = { path = "../../crates/pekko-agent-observability" }
-pekko-agent-cache = { path = "../../crates/pekko-agent-cache" }
+pekko-agent-cache    = { path = "../../crates/pekko-agent-cache" }
+pekko-agent-webhooks = { path = "../../crates/pekko-agent-webhooks" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

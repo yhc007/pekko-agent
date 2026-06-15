@@ -1,0 +1,21 @@
+[package]
+name = "pekko-agent-webhooks"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+pekko-agent-events = { path = "../pekko-agent-events" }
+sqlx      = { workspace = true }
+reqwest   = { workspace = true }
+serde     = { workspace = true }
+serde_json = { workspace = true }
+uuid      = { workspace = true }
+chrono    = { workspace = true }
+tokio     = { workspace = true }
+tracing   = { workspace = true }
+anyhow    = { workspace = true }
+hmac      = "0.12"
+sha2      = "0.10"
+hex       = "0.4"

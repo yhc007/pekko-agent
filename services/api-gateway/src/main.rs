@@ -47,6 +47,7 @@ use pekko_agent_security::{
 };
 use pekko_actor::{CircuitBreaker, CircuitBreakerBuilder};
 use pekko_agent_cache::{CacheConfig, ResponseCache};
+use pekko_agent_webhooks::{WebhookBridge, WebhookDeliverer, WebhookRegistry};
 use sqlx::PgPool;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -76,6 +77,7 @@ pub(crate) struct AppState {
     pub(crate) metrics:            Arc<MetricsRegistry>,
     pub(crate) rate_limiter:       Arc<RateLimiter>,
     pub(crate) response_cache:     Option<Arc<ResponseCache>>,
+    pub(crate) webhook_registry:   Option<Arc<WebhookRegistry>>,
 }
 
 // ── JWT extractor ─────────────────────────────────────────────────────────────
@@ -181,6 +183,25 @@ struct WsQueryRequest {
 
 fn default_tenant() -> String { "default".to_string() }
 fn default_user()   -> String { "anonymous".to_string() }
+
+// ── Webhook request / response types ─────────────────────────────────────────
+
+#[derive(Deserialize, ToSchema)]
+struct RegisterWebhookRequest {
+    url:         String,
+    event_types: Vec<String>,
+    #[serde(default)]
+    secret:      Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct WebhookResponse {
+    id:          Uuid,
+    url:         String,
+    event_types: Vec<String>,
+    active:      bool,
+    created_at:  chrono::DateTime<chrono::Utc>,
+}
 
 /// Serialised form stored in Redis — excludes per-call session_id.
 #[derive(Serialize, Deserialize)]
@@ -1414,6 +1435,95 @@ async fn register_agent(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── Webhook handlers ──────────────────────────────────────────────────────────
+
+fn wh_registry<'a>(
+    state: &'a AppState,
+) -> Result<&'a Arc<WebhookRegistry>, (StatusCode, Json<ErrorResponse>)> {
+    state.webhook_registry.as_ref().ok_or_else(|| {
+        make_error(StatusCode::SERVICE_UNAVAILABLE, "WEBHOOKS_DISABLED", "Webhook system not available")
+    })
+}
+
+/// POST /api/webhooks — register a new webhook subscription (admin)
+async fn register_webhook(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+    Json(req):    Json<RegisterWebhookRequest>,
+) -> Result<(StatusCode, Json<WebhookResponse>), (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin").await?;
+    let registry = wh_registry(&state)?;
+
+    let sub = registry
+        .create(&auth.0.tenant_id, &req.url, req.event_types, req.secret)
+        .await
+        .map_err(|e| internal_error(format!("Failed to create webhook: {e}")))?;
+
+    info!(id = %sub.id, url = %sub.url, "Webhook registered");
+    Ok((StatusCode::CREATED, Json(WebhookResponse {
+        id: sub.id, url: sub.url, event_types: sub.event_types,
+        active: sub.active, created_at: sub.created_at,
+    })))
+}
+
+/// GET /api/webhooks — list subscriptions for the caller's tenant (admin)
+async fn list_webhooks(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<WebhookResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin").await?;
+    let registry = wh_registry(&state)?;
+
+    let subs = registry
+        .list(&auth.0.tenant_id)
+        .await
+        .map_err(|e| internal_error(format!("Failed to list webhooks: {e}")))?;
+
+    Ok(Json(subs.into_iter().map(|s| WebhookResponse {
+        id: s.id, url: s.url, event_types: s.event_types,
+        active: s.active, created_at: s.created_at,
+    }).collect()))
+}
+
+/// DELETE /api/webhooks/:id — remove a subscription (admin, tenant-scoped)
+async fn delete_webhook(
+    auth:       AuthUser,
+    Path(id):   Path<Uuid>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin").await?;
+    let registry = wh_registry(&state)?;
+
+    let found = registry
+        .delete(id, &auth.0.tenant_id)
+        .await
+        .map_err(|e| internal_error(format!("Failed to delete webhook: {e}")))?;
+
+    if found {
+        info!(%id, "Webhook deleted");
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(make_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Webhook not found"))
+    }
+}
+
+/// GET /api/webhooks/:id/deliveries — last 50 delivery records (admin)
+async fn list_webhook_deliveries(
+    auth:       AuthUser,
+    Path(id):   Path<Uuid>,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin").await?;
+    let registry = wh_registry(&state)?;
+
+    let deliveries = registry
+        .list_deliveries(id, 50)
+        .await
+        .map_err(|e| internal_error(format!("Failed to list deliveries: {e}")))?;
+
+    Ok(Json(serde_json::to_value(deliveries).unwrap()))
+}
+
 // ── Cache management handlers ─────────────────────────────────────────────────
 
 /// GET /api/cache/stats — hit/miss/error counters (admin)
@@ -1491,6 +1601,10 @@ pub(crate) fn build_router(state: AppState) -> axum::Router {
         .route("/api/cache/stats",                   get(cache_stats))
         .route("/api/cache/flush",                   axum::routing::delete(cache_flush_all))
         .route("/api/cache/flush/:agent_id",         axum::routing::delete(cache_flush_agent))
+        // ── Webhook management ──
+        .route("/api/webhooks",                      post(register_webhook).get(list_webhooks))
+        .route("/api/webhooks/:id",                  axum::routing::delete(delete_webhook))
+        .route("/api/webhooks/:id/deliveries",       get(list_webhook_deliveries))
         .layer(TimeoutLayer::new(BLOCKING_TIMEOUT));
 
     let streaming_protected = Router::new()
@@ -1763,6 +1877,12 @@ async fn main() -> anyhow::Result<()> {
     let event_publisher = Arc::new(EventPublisher::new("pekko-agent", 1024));
     let audit_logger    = Arc::new(AuditLogger::new(10000));
 
+    // ── Webhook registry ──────────────────────────────────────────────────────
+    WebhookRegistry::migrate(&pg_pool).await
+        .unwrap_or_else(|e| warn!(error = %e, "Webhook migration failed — webhooks disabled"));
+    let webhook_registry = Arc::new(WebhookRegistry::new(pg_pool.clone()));
+    info!("Webhook registry ready");
+
     // ── Redis response cache ──────────────────────────────────────────────────
     let response_cache: Option<Arc<ResponseCache>> =
         if std::env::var("DISABLE_CACHE").map(|v| v == "true").unwrap_or(false) {
@@ -1803,7 +1923,17 @@ async fn main() -> anyhow::Result<()> {
         metrics,
         rate_limiter,
         response_cache,
+        webhook_registry: Some(webhook_registry.clone()),
     };
+
+    // ── Webhook bridge (background task) ─────────────────────────────────────
+    let wh_deliverer = Arc::new(WebhookDeliverer::new(webhook_registry));
+    let wh_receiver  = state.event_publisher.subscribe();
+    WebhookBridge::start(
+        state.webhook_registry.clone().unwrap(),
+        wh_deliverer,
+        wh_receiver,
+    );
 
     let port: u16 = std::env::var("API_GATEWAY_PORT")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(8080);
@@ -1950,6 +2080,7 @@ mod tests {
             metrics,
             rate_limiter,
             response_cache:   None,
+            webhook_registry: None,
         };
 
         build_router(state)

@@ -9,6 +9,7 @@ members = [
     "crates/pekko-agent-events",
     "crates/pekko-agent-security",
     "crates/pekko-agent-cache",
+    "crates/pekko-agent-webhooks",
     "services/api-gateway",
     "services/ehs-permit-agent",
     "services/ehs-inspection-agent",
