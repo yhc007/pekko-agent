@@ -17,6 +17,7 @@
 x-agent-env: &agent-env
   RUST_LOG:              ${RUST_LOG:-info}
   DATABASE_URL:          postgres://pekko:${POSTGRES_PASSWORD:-pekko_secret}@postgres:5432/pekko_agent
+  REDIS_URL:             redis://redis:6379
   CLAUDE_API_KEY:        ${CLAUDE_API_KEY}
   CLAUDE_MODEL:          ${CLAUDE_MODEL:-claude-sonnet-4-20250514}
   CLAUDE_MAX_TOKENS:     ${CLAUDE_MAX_TOKENS:-4096}
@@ -55,6 +56,21 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  # ── Redis (response cache) ──────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
   # ── API Gateway ─────────────────────────────────────────────────────────────
   api-gateway:
     build:
@@ -72,6 +88,8 @@ services:
       OTLP_ENDPOINT: ${OTLP_ENDPOINT:-}
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/api/health"]
@@ -128,6 +146,7 @@ services:
 
 volumes:
   postgres-data:
+  redis-data:
 
 networks:
   default:

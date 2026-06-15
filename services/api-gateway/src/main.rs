@@ -46,6 +46,7 @@ use pekko_agent_security::{
     RateLimiter, RateLimitConfig,
 };
 use pekko_actor::{CircuitBreaker, CircuitBreakerBuilder};
+use pekko_agent_cache::{CacheConfig, ResponseCache};
 use sqlx::PgPool;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -74,6 +75,7 @@ pub(crate) struct AppState {
     pub(crate) vector_store:       Option<Arc<PgVectorStore>>,
     pub(crate) metrics:            Arc<MetricsRegistry>,
     pub(crate) rate_limiter:       Arc<RateLimiter>,
+    pub(crate) response_cache:     Option<Arc<ResponseCache>>,
 }
 
 // ── JWT extractor ─────────────────────────────────────────────────────────────
@@ -179,6 +181,16 @@ struct WsQueryRequest {
 
 fn default_tenant() -> String { "default".to_string() }
 fn default_user()   -> String { "anonymous".to_string() }
+
+/// Serialised form stored in Redis — excludes per-call session_id.
+#[derive(Serialize, Deserialize)]
+struct CachedAgentResponse {
+    agent_id:      String,
+    response:      String,
+    tools_used:    Vec<String>,
+    input_tokens:  u32,
+    output_tokens: u32,
+}
 
 #[derive(Serialize, ToSchema)]
 struct QueryResponse {
@@ -488,9 +500,32 @@ async fn query_agent(
 ) -> Result<Json<QueryResponse>, (StatusCode, Json<ErrorResponse>)> {
     require_permission(&state, &auth.0, "agent.delegate").await?;
 
+    let is_stateless = req.session_id.is_none();
+    let query_content = req.content.clone();
     let session_id = req.session_id.unwrap_or_else(Uuid::new_v4);
     let user_id    = auth.0.sub.clone();
     let tenant_id  = auth.0.tenant_id.clone();
+
+    // ── Cache lookup (stateless queries only) ─────────────────────────────────
+    if is_stateless {
+        if let Some(cache) = &state.response_cache {
+            if let Some(json) = cache.get(&agent_id, &tenant_id, &query_content).await {
+                if let Ok(cached) = serde_json::from_str::<CachedAgentResponse>(&json) {
+                    info!(agent_id = %agent_id, tenant = %tenant_id, "Cache HIT — skipping orchestrator");
+                    return Ok(Json(QueryResponse {
+                        session_id:  Uuid::new_v4(),
+                        agent_id:    cached.agent_id,
+                        response:    cached.response,
+                        tools_used:  cached.tools_used,
+                        token_usage: TokenUsage {
+                            input_tokens:  cached.input_tokens,
+                            output_tokens: cached.output_tokens,
+                        },
+                    }));
+                }
+            }
+        }
+    }
 
     info!(
         agent_id = %agent_id, session_id = %session_id,
@@ -540,6 +575,23 @@ async fn query_agent(
                     "output_tokens": r.output_tokens,
                 }),
             ));
+
+            // ── Cache store (stateless queries only) ──────────────────────────
+            if is_stateless {
+                if let Some(cache) = &state.response_cache {
+                    let to_cache = CachedAgentResponse {
+                        agent_id:      r.agent_id.clone(),
+                        response:      r.response.clone(),
+                        tools_used:    r.tools_used.clone(),
+                        input_tokens:  r.input_tokens,
+                        output_tokens: r.output_tokens,
+                    };
+                    if let Ok(json) = serde_json::to_string(&to_cache) {
+                        cache.set(&agent_id, &tenant_id, &query_content, &json).await;
+                    }
+                }
+            }
+
             Ok(Json(QueryResponse {
                 session_id:  r.session_id,
                 agent_id:    r.agent_id,
@@ -1362,6 +1414,53 @@ async fn register_agent(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── Cache management handlers ─────────────────────────────────────────────────
+
+/// GET /api/cache/stats — hit/miss/error counters (admin)
+async fn cache_stats(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin").await?;
+    match &state.response_cache {
+        Some(cache) => Ok(Json(serde_json::to_value(cache.stats()).unwrap())),
+        None => Ok(Json(serde_json::json!({ "status": "disabled" }))),
+    }
+}
+
+/// DELETE /api/cache/flush — flush all cached responses (admin)
+async fn cache_flush_all(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin").await?;
+    match &state.response_cache {
+        Some(cache) => {
+            let deleted = cache.flush_all().await;
+            info!(deleted, "Cache flushed (all)");
+            Ok(Json(serde_json::json!({ "deleted": deleted })))
+        }
+        None => Ok(Json(serde_json::json!({ "status": "disabled" }))),
+    }
+}
+
+/// DELETE /api/cache/flush/:agent_id — flush cached responses for one agent (admin)
+async fn cache_flush_agent(
+    auth:           AuthUser,
+    Path(agent_id): Path<String>,
+    State(state):   State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin").await?;
+    match &state.response_cache {
+        Some(cache) => {
+            let deleted = cache.flush_agent(&agent_id).await;
+            info!(%agent_id, deleted, "Cache flushed (agent)");
+            Ok(Json(serde_json::json!({ "agent_id": agent_id, "deleted": deleted })))
+        }
+        None => Ok(Json(serde_json::json!({ "status": "disabled" }))),
+    }
+}
+
 // ── Router builder ───────────────────────────────────────────────────────────
 
 /// Build the Axum HTTP router from a fully-initialised `AppState`.
@@ -1388,6 +1487,10 @@ pub(crate) fn build_router(state: AppState) -> axum::Router {
         .route("/api/sagas/executions/:exec_id",     get(get_saga_execution))
         .route("/api/agents/collaborate",            post(collaborate_agents))
         .route("/api/events/history",                get(event_history))
+        // ── Cache management ──
+        .route("/api/cache/stats",                   get(cache_stats))
+        .route("/api/cache/flush",                   axum::routing::delete(cache_flush_all))
+        .route("/api/cache/flush/:agent_id",         axum::routing::delete(cache_flush_agent))
         .layer(TimeoutLayer::new(BLOCKING_TIMEOUT));
 
     let streaming_protected = Router::new()
@@ -1660,6 +1763,33 @@ async fn main() -> anyhow::Result<()> {
     let event_publisher = Arc::new(EventPublisher::new("pekko-agent", 1024));
     let audit_logger    = Arc::new(AuditLogger::new(10000));
 
+    // ── Redis response cache ──────────────────────────────────────────────────
+    let response_cache: Option<Arc<ResponseCache>> =
+        if std::env::var("DISABLE_CACHE").map(|v| v == "true").unwrap_or(false) {
+            info!("Response cache disabled by DISABLE_CACHE=true");
+            None
+        } else {
+            let redis_url = std::env::var("REDIS_URL")
+                .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+            let ttl_secs: u64 = std::env::var("CACHE_TTL_SECONDS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+            let cfg = CacheConfig {
+                redis_url,
+                default_ttl_seconds: ttl_secs,
+                ..CacheConfig::default()
+            };
+            match ResponseCache::new(cfg).await {
+                Ok(cache) => {
+                    info!(ttl_secs, "Redis response cache ready");
+                    Some(Arc::new(cache))
+                }
+                Err(e) => {
+                    warn!(error = %e, "Redis unavailable — response cache disabled");
+                    None
+                }
+            }
+        };
+
     let state = AppState {
         tool_registry,
         conversation_store,
@@ -1672,6 +1802,7 @@ async fn main() -> anyhow::Result<()> {
         vector_store,
         metrics,
         rate_limiter,
+        response_cache,
     };
 
     let port: u16 = std::env::var("API_GATEWAY_PORT")
@@ -1815,9 +1946,10 @@ mod tests {
             jwt_manager,
             rbac,
             api_keys,
-            vector_store: None,
+            vector_store:     None,
             metrics,
             rate_limiter,
+            response_cache:   None,
         };
 
         build_router(state)
