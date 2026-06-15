@@ -1362,6 +1362,54 @@ async fn register_agent(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── Router builder ───────────────────────────────────────────────────────────
+
+/// Build the Axum HTTP router from a fully-initialised `AppState`.
+/// Extracted so integration tests can reuse it without starting a real server.
+pub(crate) fn build_router(state: AppState) -> axum::Router {
+    let public_routes = Router::new()
+        .route("/api/health",      get(health_check))
+        .route("/api/auth/token",  post(issue_token))
+        .route("/metrics",         get(prometheus_metrics));
+
+    let blocking_protected = Router::new()
+        .route("/api/agents",                        get(list_agents))
+        .route("/api/agents/register",               post(register_agent))
+        .route("/api/agents/:agent_id/query",        post(query_agent))
+        .route("/api/sessions/:session_id/history",  get(get_session_history))
+        .route("/api/tools",                         get(list_tools))
+        .route("/api/workflows",                     post(execute_workflow))
+        .route("/api/workflows/:workflow_id",        get(get_workflow_status))
+        .route("/api/memory/store",                  post(memory_store))
+        .route("/api/memory/search",                 post(memory_search))
+        .route("/api/memory/:doc_id",                axum::routing::delete(memory_delete))
+        .route("/api/sagas/definitions",             post(register_saga).get(list_sagas))
+        .route("/api/sagas/:saga_id/execute",        post(execute_saga))
+        .route("/api/sagas/executions/:exec_id",     get(get_saga_execution))
+        .route("/api/agents/collaborate",            post(collaborate_agents))
+        .route("/api/events/history",                get(event_history))
+        .layer(TimeoutLayer::new(BLOCKING_TIMEOUT));
+
+    let streaming_protected = Router::new()
+        .route("/api/agents/:agent_id/query/stream", post(stream_query_agent))
+        .route("/api/agents/:agent_id/ws",           get(ws_agent))
+        .route("/api/workflows/stream",              post(stream_workflow))
+        .route("/api/sagas/:saga_id/stream",         post(stream_saga))
+        .route("/api/agents/collaborate/stream",     post(stream_collaborate_agents))
+        .route("/api/events/stream",                 get(stream_events));
+
+    Router::new()
+        .merge(public_routes)
+        .merge(blocking_protected)
+        .merge(streaming_protected)
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
+        .layer(middleware::from_fn_with_state(state.clone(), http_metrics_middleware))
+        .layer(CorsLayer::permissive())
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+        .merge(openapi::swagger_routes())
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -1626,64 +1674,12 @@ async fn main() -> anyhow::Result<()> {
         rate_limiter,
     };
 
-    // ── Router ────────────────────────────────────────────────────────────────
-    //
-    // Public:    /api/health, /api/auth/token
-    // Protected: everything else
-    //
-    // Blocking routes wrapped in TimeoutLayer(60s).
-    // Streaming routes (SSE, WS) have no response timeout.
-    //
-    let public_routes = Router::new()
-        .route("/api/health",      get(health_check))
-        .route("/api/auth/token",  post(issue_token))
-        .route("/metrics",         get(prometheus_metrics)); // Prometheus scrape
-
-    let blocking_protected = Router::new()
-        .route("/api/agents",                        get(list_agents))
-        .route("/api/agents/register",               post(register_agent))
-        .route("/api/agents/:agent_id/query",        post(query_agent))
-        .route("/api/sessions/:session_id/history",  get(get_session_history))
-        .route("/api/tools",                         get(list_tools))
-        .route("/api/workflows",                     post(execute_workflow))
-        .route("/api/workflows/:workflow_id",        get(get_workflow_status))
-        .route("/api/memory/store",                  post(memory_store))
-        .route("/api/memory/search",                 post(memory_search))
-        .route("/api/memory/:doc_id",                axum::routing::delete(memory_delete))
-        // ── Saga ──
-        .route("/api/sagas/definitions",             post(register_saga).get(list_sagas))
-        .route("/api/sagas/:saga_id/execute",        post(execute_saga))
-        .route("/api/sagas/executions/:exec_id",     get(get_saga_execution))
-        // ── Multi-agent collaboration ──
-        .route("/api/agents/collaborate",            post(collaborate_agents))
-        // ── Event history ──
-        .route("/api/events/history",                get(event_history))
-        .layer(TimeoutLayer::new(BLOCKING_TIMEOUT));
-
-    let streaming_protected = Router::new()
-        .route("/api/agents/:agent_id/query/stream", post(stream_query_agent))
-        .route("/api/agents/:agent_id/ws",           get(ws_agent))
-        .route("/api/workflows/stream",              post(stream_workflow))
-        .route("/api/sagas/:saga_id/stream",         post(stream_saga))
-        .route("/api/agents/collaborate/stream",     post(stream_collaborate_agents))
-        .route("/api/events/stream",                 get(stream_events));
-
     let port: u16 = std::env::var("API_GATEWAY_PORT")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(8080);
 
     // Clone state for gRPC before moving it into the HTTP router
     let grpc_state = state.clone();
-
-    let app = Router::new()
-        .merge(public_routes)
-        .merge(blocking_protected)
-        .merge(streaming_protected)
-        // Rate limiting runs before metrics so rejected requests are still counted
-        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
-        .layer(middleware::from_fn_with_state(state.clone(), http_metrics_middleware))
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+    let app = build_router(state);
 
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -1705,9 +1701,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Swagger UI + raw spec (stateless, merged after with_state)
-    let app = app.merge(openapi::swagger_routes());
-
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
@@ -1722,4 +1715,372 @@ async fn shutdown_signal() {
     tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl+c");
     info!("Graceful shutdown — flushing OTel spans");
     // _otel_provider drops here, triggering TracerProvider::shutdown via Drop
+}
+
+// ── Integration tests ─────────────────────────────────────────────────────────
+//
+// Run with:
+//   TEST_DATABASE_URL=postgres://... cargo test -p api-gateway -- --test-threads=1
+//
+// Tests skip gracefully when TEST_DATABASE_URL is not set.
+// Each test builds a fresh AppState against the test database.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    const TEST_JWT_SECRET: &[u8] = b"integration-test-secret-32chars!!";
+    const TEST_ADMIN_KEY:   &str = "integration-test-admin-key";
+    const TEST_USER_KEY:    &str = "integration-test-user-key";
+
+    fn test_db_url() -> Option<String> {
+        std::env::var("TEST_DATABASE_URL").ok()
+    }
+
+    /// Build a minimal `AppState` wired to a real Postgres instance.
+    async fn build_test_app() -> axum::Router {
+        let db_url = test_db_url().expect("TEST_DATABASE_URL must be set");
+
+        let pg_pool = Arc::new(
+            PgPool::connect(&db_url).await
+                .expect("Failed to connect to test database"),
+        );
+
+        PgConversationStore::migrate(&pg_pool).await
+            .unwrap_or_else(|e| warn!("Migration note (may already exist): {e}"));
+
+        let jwt_manager = Arc::new(JwtManager::new(TEST_JWT_SECRET).with_ttl(3600));
+
+        let mut api_keys_map: HashMap<String, ApiKeyEntry> = HashMap::new();
+        api_keys_map.insert(TEST_ADMIN_KEY.to_string(), ApiKeyEntry {
+            user_id:   "test-admin".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            roles:     vec!["admin".to_string()],
+        });
+        api_keys_map.insert(TEST_USER_KEY.to_string(), ApiKeyEntry {
+            user_id:   "test-user".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            roles:     vec!["user".to_string()],
+        });
+        let api_keys = Arc::new(api_keys_map);
+
+        let rbac    = Arc::new(RwLock::new(RbacManager::new()));
+        let metrics = MetricsRegistry::new().expect("test MetricsRegistry");
+
+        let rate_limiter = Arc::new(RateLimiter::new(RateLimitConfig {
+            admin_rpm: 100_000, agent_rpm: 100_000, default_rpm: 100_000,
+        }));
+
+        let event_publisher = Arc::new(EventPublisher::new("test", 128));
+        let audit_logger    = Arc::new(AuditLogger::new(1000));
+        let tool_registry   = Arc::new(RwLock::new(ToolRegistry::new()));
+        let conversation_store = Arc::new(PgConversationStore::new(pg_pool.clone(), 100));
+
+        let llm_config = LlmConfig {
+            api_key:    std::env::var("CLAUDE_API_KEY").unwrap_or_else(|_| "test-key".to_string()),
+            model:      "claude-haiku-4-5-20251001".to_string(),
+            max_tokens: 128,
+            ..LlmConfig::default()
+        };
+        let claude_client = Arc::new(ClaudeClient::new(llm_config.clone()));
+
+        let actor_system = pekko_actor::ActorSystem::new("pekko-agent-test");
+
+        let deps = OrchestratorDeps {
+            conversation_store: conversation_store.clone(),
+            tool_registry:      tool_registry.clone(),
+            claude_client,
+            gemini_client:      None,
+            openai_client:      None,
+            llm_config,
+            llm_provider:       "claude".to_string(),
+            vector_store:       None,
+            metrics:            Some(metrics.clone()),
+            circuit_breakers:   std::collections::HashMap::new(),
+            persistence:        None,
+        };
+
+        let orchestrator_ref = actor_system
+            .spawn(OrchestratorActor::new(deps), "orchestrator")
+            .await
+            .expect("Failed to spawn test orchestrator");
+
+        let state = AppState {
+            tool_registry,
+            conversation_store,
+            orchestrator_ref,
+            event_publisher,
+            audit_logger,
+            jwt_manager,
+            rbac,
+            api_keys,
+            vector_store: None,
+            metrics,
+            rate_limiter,
+        };
+
+        build_router(state)
+    }
+
+    /// Exchange an API key for a JWT, returning the token string.
+    async fn get_jwt(app: &axum::Router, key: &str) -> String {
+        let body = serde_json::to_vec(&serde_json::json!({ "api_key": key })).unwrap();
+        let resp = app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        v["token"].as_str().expect("no token in response").to_string()
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn health_check_returns_ok() {
+        if test_db_url().is_none() { return; }
+        let app = build_test_app().await;
+
+        let resp = app
+            .oneshot(Request::builder().uri("/api/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+        ).unwrap();
+        assert_eq!(body["status"], "healthy");
+    }
+
+    #[tokio::test]
+    async fn auth_valid_admin_key_returns_jwt() {
+        if test_db_url().is_none() { return; }
+        let app = build_test_app().await;
+
+        let body = serde_json::to_vec(&serde_json::json!({ "api_key": TEST_ADMIN_KEY })).unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+        ).unwrap();
+        assert!(json["token"].is_string(), "token field missing");
+        assert_eq!(json["token_type"], "Bearer");
+        assert_eq!(json["user_id"], "test-admin");
+    }
+
+    #[tokio::test]
+    async fn auth_valid_user_key_returns_jwt() {
+        if test_db_url().is_none() { return; }
+        let app = build_test_app().await;
+
+        let body = serde_json::to_vec(&serde_json::json!({ "api_key": TEST_USER_KEY })).unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+        ).unwrap();
+        assert_eq!(json["user_id"], "test-user");
+    }
+
+    #[tokio::test]
+    async fn auth_invalid_key_returns_401() {
+        if test_db_url().is_none() { return; }
+        let app = build_test_app().await;
+
+        let body = serde_json::to_vec(&serde_json::json!({ "api_key": "wrong-key" })).unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn protected_endpoint_without_auth_returns_401() {
+        if test_db_url().is_none() { return; }
+        let app = build_test_app().await;
+
+        let resp = app
+            .oneshot(Request::builder().uri("/api/agents").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn protected_endpoint_with_bad_bearer_returns_401() {
+        if test_db_url().is_none() { return; }
+        let app = build_test_app().await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents")
+                    .header("authorization", "Bearer this.is.invalid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn list_agents_with_admin_token_returns_array() {
+        if test_db_url().is_none() { return; }
+        let app = build_test_app().await;
+        let token = get_jwt(&app, TEST_ADMIN_KEY).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+        ).unwrap();
+        assert!(body.is_array(), "expected JSON array, got: {body}");
+    }
+
+    #[tokio::test]
+    async fn event_history_returns_ok_with_admin_token() {
+        if test_db_url().is_none() { return; }
+        let app = build_test_app().await;
+        let token = get_jwt(&app, TEST_ADMIN_KEY).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events/history")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn memory_store_requires_admin_role() {
+        if test_db_url().is_none() { return; }
+        let app = build_test_app().await;
+        let user_token = get_jwt(&app, TEST_USER_KEY).await;
+
+        let body = serde_json::to_vec(
+            &serde_json::json!({ "content": "test", "source": "test" })
+        ).unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memory/store")
+                    .header("authorization", format!("Bearer {user_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // user role is not admin — must be rejected
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn openapi_spec_returns_valid_json() {
+        if test_db_url().is_none() { return; }
+        let app = build_test_app().await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+        ).unwrap();
+        assert_eq!(body["info"]["title"], "Pekko Agent API");
+        assert!(body["paths"].is_object(), "paths should be present");
+    }
+
+    #[tokio::test]
+    async fn user_cannot_query_agent() {
+        if test_db_url().is_none() { return; }
+        let app = build_test_app().await;
+        let user_token = get_jwt(&app, TEST_USER_KEY).await;
+
+        let body = serde_json::to_vec(
+            &serde_json::json!({ "content": "test query" })
+        ).unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/agents/ehs-permit-agent/query")
+                    .header("authorization", format!("Bearer {user_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
 }

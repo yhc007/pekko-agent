@@ -99,12 +99,56 @@ jobs:
             -p ehs-compliance-agent \
             -- -W clippy::all -A clippy::too_many_arguments
 
+  # ── Integration Tests ─────────────────────────────────────────────────────
+  integration:
+    name: Integration Tests (api-gateway)
+    runs-on: ubuntu-latest
+    needs: [check]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER:     pekko
+          POSTGRES_PASSWORD: pekko_secret
+          POSTGRES_DB:       pekko_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_DATABASE_URL: postgres://pekko:pekko_secret@localhost:5432/pekko_test
+      DISABLE_VECTOR_STORE: "true"
+      DISABLE_ORCHESTRATOR_PERSISTENCE: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-integration-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run integration tests
+        run: |
+          cargo test -p api-gateway \
+            -- --test-threads=1 --nocapture
+
   # ── Docker Build Smoke Test ───────────────────────────────────────────────
   docker-build:
     name: Docker Build (api-gateway)
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
-    needs: [test, check]
+    needs: [test, check, integration]
     steps:
       - uses: actions/checkout@v4
 
