@@ -7,6 +7,8 @@ pub mod rate_limiter;
 pub mod pg_audit;
 #[cfg(feature = "postgres")]
 pub mod api_keys;
+#[cfg(feature = "postgres")]
+pub mod pg_tenants;
 
 pub use jwt::*;
 pub use rbac::*;
@@ -17,3 +19,5 @@ pub use rate_limiter::{RateLimiter, RateLimitConfig, RateLimitError};
 pub use pg_audit::{AuditQuery, PgAuditStore};
 #[cfg(feature = "postgres")]
 pub use api_keys::{ApiKeyStore, ApiKeyCreated, StoredApiKey};
+#[cfg(feature = "postgres")]
+pub use pg_tenants::{PgTenantStore, StoredTenant, CreateTenantRequest, UpdateTenantRequest};

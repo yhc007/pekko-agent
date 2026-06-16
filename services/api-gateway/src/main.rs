@@ -44,6 +44,8 @@ use pekko_agent_events::{AgentEventEnvelope, EventPublisher, event_types};
 use pekko_agent_security::{
     AuditLogger, AuditEntry, AuditOutcome, AuditQuery, PgAuditStore,
     ApiKeyStore, ApiKeyCreated, StoredApiKey,
+    PgTenantStore, StoredTenant, CreateTenantRequest as TenantCreateReq,
+    UpdateTenantRequest as TenantUpdateReq,
     Claims, JwtError, JwtManager, RbacManager,
     RateLimiter, RateLimitConfig,
 };
@@ -82,6 +84,7 @@ pub(crate) struct AppState {
     pub(crate) webhook_registry:   Option<Arc<WebhookRegistry>>,
     pub(crate) pg_audit_store:     Arc<PgAuditStore>,
     pub(crate) api_key_store:      Arc<ApiKeyStore>,
+    pub(crate) tenant_store:       Arc<PgTenantStore>,
 }
 
 // ── JWT extractor ─────────────────────────────────────────────────────────────
@@ -542,6 +545,27 @@ async fn query_agent(
     let session_id = req.session_id.unwrap_or_else(Uuid::new_v4);
     let user_id    = auth.0.sub.clone();
     let tenant_id  = auth.0.tenant_id.clone();
+
+    // ── Tenant active check ───────────────────────────────────────────────────
+    // If the tenant exists in the store and is inactive, reject. Unknown tenants
+    // (not yet registered in pekko_tenants) are allowed through for backward compat.
+    match state.tenant_store.get_active(&tenant_id).await {
+        Ok(None) => {
+            // Check whether the tenant exists but is inactive
+            if let Ok(Some(_)) = state.tenant_store.get(&tenant_id).await {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(ErrorResponse {
+                        error: format!("Tenant {tenant_id} is deactivated"),
+                        code:  "TENANT_INACTIVE".to_string(),
+                    }),
+                ));
+            }
+            // Tenant not in DB yet — allowed (legacy / env-var path)
+        }
+        Ok(Some(_)) => {} // active tenant — proceed
+        Err(e) => warn!(error = %e, tenant = %tenant_id, "Tenant store lookup failed — proceeding"),
+    }
 
     // ── Cache lookup (stateless queries only) ─────────────────────────────────
     if is_stateless {
@@ -1758,6 +1782,127 @@ async fn rotate_api_key(
     }
 }
 
+// ── Tenant management handlers ────────────────────────────────────────────────
+
+/// POST /api/admin/tenants — create a new tenant (admin)
+async fn create_tenant(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+    Json(req):    Json<TenantCreateReq>,
+) -> Result<Json<StoredTenant>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin").await?;
+
+    let tenant = state.tenant_store
+        .create(req)
+        .await
+        .map_err(|e| internal_error(format!("Failed to create tenant: {e}")))?;
+
+    info!(id = %tenant.id, name = %tenant.name, "Tenant created");
+    Ok(Json(tenant))
+}
+
+/// GET /api/admin/tenants — list tenants (admin)
+async fn list_tenants(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<StoredTenant>>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin").await?;
+
+    let tenants = state.tenant_store
+        .list(false)
+        .await
+        .map_err(|e| internal_error(format!("Failed to list tenants: {e}")))?;
+
+    Ok(Json(tenants))
+}
+
+/// GET /api/admin/tenants/:id — get tenant details (admin)
+async fn get_tenant(
+    auth:         AuthUser,
+    Path(id):     Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<StoredTenant>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin").await?;
+
+    state.tenant_store
+        .get(&id)
+        .await
+        .map_err(|e| internal_error(format!("Failed to get tenant: {e}")))?
+        .map(Json)
+        .ok_or_else(|| (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse { error: format!("Tenant {id} not found"), code: "NOT_FOUND".to_string() }),
+        ))
+}
+
+/// PUT /api/admin/tenants/:id — update tenant settings (admin)
+async fn update_tenant(
+    auth:         AuthUser,
+    Path(id):     Path<String>,
+    State(state): State<AppState>,
+    Json(req):    Json<TenantUpdateReq>,
+) -> Result<Json<StoredTenant>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin").await?;
+
+    state.tenant_store
+        .update(&id, req)
+        .await
+        .map_err(|e| internal_error(format!("Failed to update tenant: {e}")))?
+        .map(Json)
+        .ok_or_else(|| (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse { error: format!("Tenant {id} not found"), code: "NOT_FOUND".to_string() }),
+        ))
+}
+
+/// DELETE /api/admin/tenants/:id — deactivate tenant (admin; soft delete)
+async fn deactivate_tenant(
+    auth:         AuthUser,
+    Path(id):     Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin").await?;
+
+    let deactivated = state.tenant_store
+        .deactivate(&id)
+        .await
+        .map_err(|e| internal_error(format!("Failed to deactivate tenant: {e}")))?;
+
+    if deactivated {
+        info!(%id, "Tenant deactivated");
+        Ok(Json(serde_json::json!({ "id": id, "active": false })))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse { error: format!("Tenant {id} not found or already inactive"), code: "NOT_FOUND".to_string() }),
+        ))
+    }
+}
+
+/// POST /api/admin/tenants/:id/activate — re-enable a deactivated tenant (admin)
+async fn activate_tenant(
+    auth:         AuthUser,
+    Path(id):     Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin").await?;
+
+    let activated = state.tenant_store
+        .activate(&id)
+        .await
+        .map_err(|e| internal_error(format!("Failed to activate tenant: {e}")))?;
+
+    if activated {
+        info!(%id, "Tenant activated");
+        Ok(Json(serde_json::json!({ "id": id, "active": true })))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse { error: format!("Tenant {id} not found"), code: "NOT_FOUND".to_string() }),
+        ))
+    }
+}
+
 // ── Router builder ───────────────────────────────────────────────────────────
 
 /// Build the Axum HTTP router from a fully-initialised `AppState`.
@@ -1799,6 +1944,12 @@ pub(crate) fn build_router(state: AppState) -> axum::Router {
         .route("/api/admin/api-keys",                post(create_api_key).get(list_api_keys))
         .route("/api/admin/api-keys/:id",            axum::routing::delete(revoke_api_key))
         .route("/api/admin/api-keys/:id/rotate",     post(rotate_api_key))
+        // ── Tenant management ──
+        .route("/api/admin/tenants",                 post(create_tenant).get(list_tenants))
+        .route("/api/admin/tenants/:id",             get(get_tenant)
+                                                         .put(update_tenant)
+                                                         .delete(deactivate_tenant))
+        .route("/api/admin/tenants/:id/activate",    post(activate_tenant))
         .layer(TimeoutLayer::new(BLOCKING_TIMEOUT));
 
     let streaming_protected = Router::new()
@@ -2079,6 +2230,12 @@ async fn main() -> anyhow::Result<()> {
     let api_key_store = Arc::new(ApiKeyStore::new(pg_pool.clone()));
     info!("API key store ready");
 
+    // ── Tenant store ──────────────────────────────────────────────────────────
+    PgTenantStore::migrate(&pg_pool).await
+        .expect("Tenant store migration failed");
+    let tenant_store = Arc::new(PgTenantStore::new(pg_pool.clone()));
+    info!("Tenant store ready");
+
     // ── Infrastructure ────────────────────────────────────────────────────────
     let event_publisher = Arc::new(EventPublisher::new("pekko-agent", 1024));
     let audit_logger    = Arc::new(
@@ -2134,6 +2291,7 @@ async fn main() -> anyhow::Result<()> {
         webhook_registry: Some(webhook_registry.clone()),
         pg_audit_store,
         api_key_store,
+        tenant_store,
     };
 
     // ── Webhook bridge (background task) ─────────────────────────────────────
@@ -2229,6 +2387,10 @@ mod tests {
             .unwrap_or_else(|e| warn!("API key store migration note: {e}"));
         let api_key_store = Arc::new(ApiKeyStore::new(pg_pool.clone()));
 
+        PgTenantStore::migrate(&pg_pool).await
+            .unwrap_or_else(|e| warn!("Tenant store migration note: {e}"));
+        let tenant_store = Arc::new(PgTenantStore::new(pg_pool.clone()));
+
         let jwt_manager = Arc::new(JwtManager::new(TEST_JWT_SECRET).with_ttl(3600));
 
         let mut api_keys_map: HashMap<String, ApiKeyEntry> = HashMap::new();
@@ -2301,6 +2463,7 @@ mod tests {
             webhook_registry: None,
             pg_audit_store,
             api_key_store,
+            tenant_store,
         };
 
         build_router(state)
