@@ -43,6 +43,7 @@ use pekko_agent_orchestrator::saga::{SagaDefinition, SagaResult};
 use pekko_agent_events::{AgentEventEnvelope, EventPublisher, event_types};
 use pekko_agent_security::{
     AuditLogger, AuditEntry, AuditOutcome, AuditQuery, PgAuditStore,
+    ApiKeyStore, ApiKeyCreated, StoredApiKey,
     Claims, JwtError, JwtManager, RbacManager,
     RateLimiter, RateLimitConfig,
 };
@@ -80,6 +81,7 @@ pub(crate) struct AppState {
     pub(crate) response_cache:     Option<Arc<ResponseCache>>,
     pub(crate) webhook_registry:   Option<Arc<WebhookRegistry>>,
     pub(crate) pg_audit_store:     Arc<PgAuditStore>,
+    pub(crate) api_key_store:      Arc<ApiKeyStore>,
 }
 
 // ── JWT extractor ─────────────────────────────────────────────────────────────
@@ -454,25 +456,37 @@ async fn issue_token(
     State(state): State<AppState>,
     Json(req):    Json<AuthRequest>,
 ) -> Result<Json<AuthResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let entry = state.api_keys.get(&req.api_key)
-        .ok_or_else(|| unauthorized("Invalid API key"))?;
+    // 1. Try DB-backed keys first
+    let db_entry = state.api_key_store
+        .verify(&req.api_key)
+        .await
+        .map_err(|e| internal_error(format!("API key lookup failed: {e}")))?;
 
-    let tenant_id = req.tenant_id
-        .unwrap_or_else(|| entry.tenant_id.clone());
+    let (user_id, default_tenant_id, roles) = if let Some(k) = db_entry {
+        (k.user_id, k.tenant_id, k.roles)
+    } else {
+        // 2. Fall back to env-var backed HashMap (backward compat)
+        let entry = state.api_keys
+            .get(&req.api_key)
+            .ok_or_else(|| unauthorized("Invalid API key"))?;
+        (entry.user_id.clone(), entry.tenant_id.clone(), entry.roles.clone())
+    };
+
+    let tenant_id = req.tenant_id.unwrap_or(default_tenant_id);
 
     let token = state.jwt_manager
-        .issue(&entry.user_id, &tenant_id, entry.roles.clone())
+        .issue(&user_id, &tenant_id, roles.clone())
         .map_err(|e| internal_error(format!("Token issuance failed: {e}")))?;
 
-    info!(user = %entry.user_id, tenant = %tenant_id, "JWT issued");
+    info!(user = %user_id, tenant = %tenant_id, "JWT issued");
 
     Ok(Json(AuthResponse {
         token,
         token_type: "Bearer",
         expires_in: state.jwt_manager.token_ttl_seconds,
         tenant_id,
-        user_id: entry.user_id.clone(),
-        roles:   entry.roles.clone(),
+        user_id,
+        roles,
     }))
 }
 
@@ -1651,6 +1665,99 @@ async fn cache_flush_agent(
     }
 }
 
+// ── API key management handlers ───────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct CreateApiKeyRequest {
+    name:       String,
+    user_id:    String,
+    tenant_id:  String,
+    roles:      Vec<String>,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// POST /api/admin/api-keys — create a new DB-backed API key (admin)
+async fn create_api_key(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+    Json(req):    Json<CreateApiKeyRequest>,
+) -> Result<Json<ApiKeyCreated>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin").await?;
+
+    let created = state.api_key_store
+        .create(&req.name, &req.user_id, &req.tenant_id, req.roles, req.expires_at)
+        .await
+        .map_err(|e| internal_error(format!("Failed to create API key: {e}")))?;
+
+    info!(id = %created.id, name = %created.name, user = %created.user_id, "API key created");
+    Ok(Json(created))
+}
+
+/// GET /api/admin/api-keys — list all API keys for caller's tenant (admin)
+async fn list_api_keys(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<StoredApiKey>>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin").await?;
+
+    let keys = state.api_key_store
+        .list(Some(&auth.0.tenant_id))
+        .await
+        .map_err(|e| internal_error(format!("Failed to list API keys: {e}")))?;
+
+    Ok(Json(keys))
+}
+
+/// DELETE /api/admin/api-keys/:id — revoke an API key (admin)
+async fn revoke_api_key(
+    auth:         AuthUser,
+    Path(id):     Path<Uuid>,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin").await?;
+
+    let revoked = state.api_key_store
+        .revoke(id)
+        .await
+        .map_err(|e| internal_error(format!("Failed to revoke API key: {e}")))?;
+
+    if revoked {
+        info!(%id, "API key revoked");
+        Ok(Json(serde_json::json!({ "id": id, "revoked": true })))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse { error: format!("API key {id} not found or already revoked"), code: "NOT_FOUND".to_string() }),
+        ))
+    }
+}
+
+/// POST /api/admin/api-keys/:id/rotate — rotate an API key (admin)
+/// Atomically revokes the old key and issues a new one with identical metadata.
+async fn rotate_api_key(
+    auth:         AuthUser,
+    Path(id):     Path<Uuid>,
+    State(state): State<AppState>,
+) -> Result<Json<ApiKeyCreated>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "admin").await?;
+
+    let rotated = state.api_key_store
+        .rotate(id)
+        .await
+        .map_err(|e| internal_error(format!("Failed to rotate API key: {e}")))?;
+
+    match rotated {
+        Some(new_key) => {
+            info!(old_id = %id, new_id = %new_key.id, "API key rotated");
+            Ok(Json(new_key))
+        }
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse { error: format!("API key {id} not found or already revoked"), code: "NOT_FOUND".to_string() }),
+        )),
+    }
+}
+
 // ── Router builder ───────────────────────────────────────────────────────────
 
 /// Build the Axum HTTP router from a fully-initialised `AppState`.
@@ -1688,6 +1795,10 @@ pub(crate) fn build_router(state: AppState) -> axum::Router {
         .route("/api/webhooks",                      post(register_webhook).get(list_webhooks))
         .route("/api/webhooks/:id",                  axum::routing::delete(delete_webhook))
         .route("/api/webhooks/:id/deliveries",       get(list_webhook_deliveries))
+        // ── DB-backed API key management ──
+        .route("/api/admin/api-keys",                post(create_api_key).get(list_api_keys))
+        .route("/api/admin/api-keys/:id",            axum::routing::delete(revoke_api_key))
+        .route("/api/admin/api-keys/:id/rotate",     post(rotate_api_key))
         .layer(TimeoutLayer::new(BLOCKING_TIMEOUT));
 
     let streaming_protected = Router::new()
@@ -1962,6 +2073,12 @@ async fn main() -> anyhow::Result<()> {
     let pg_audit_store = Arc::new(PgAuditStore::new(pg_pool.clone()));
     info!("Audit log store ready");
 
+    // ── DB-backed API key store ───────────────────────────────────────────────
+    ApiKeyStore::migrate(&pg_pool).await
+        .expect("API key store migration failed");
+    let api_key_store = Arc::new(ApiKeyStore::new(pg_pool.clone()));
+    info!("API key store ready");
+
     // ── Infrastructure ────────────────────────────────────────────────────────
     let event_publisher = Arc::new(EventPublisher::new("pekko-agent", 1024));
     let audit_logger    = Arc::new(
@@ -2016,6 +2133,7 @@ async fn main() -> anyhow::Result<()> {
         response_cache,
         webhook_registry: Some(webhook_registry.clone()),
         pg_audit_store,
+        api_key_store,
     };
 
     // ── Webhook bridge (background task) ─────────────────────────────────────
@@ -2107,6 +2225,10 @@ mod tests {
             .unwrap_or_else(|e| warn!("Audit migration note: {e}"));
         let pg_audit_store = Arc::new(PgAuditStore::new(pg_pool.clone()));
 
+        ApiKeyStore::migrate(&pg_pool).await
+            .unwrap_or_else(|e| warn!("API key store migration note: {e}"));
+        let api_key_store = Arc::new(ApiKeyStore::new(pg_pool.clone()));
+
         let jwt_manager = Arc::new(JwtManager::new(TEST_JWT_SECRET).with_ttl(3600));
 
         let mut api_keys_map: HashMap<String, ApiKeyEntry> = HashMap::new();
@@ -2178,6 +2300,7 @@ mod tests {
             response_cache:   None,
             webhook_registry: None,
             pg_audit_store,
+            api_key_store,
         };
 
         build_router(state)
