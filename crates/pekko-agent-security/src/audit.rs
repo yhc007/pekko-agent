@@ -6,6 +6,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
 
+#[cfg(feature = "postgres")]
+use crate::pg_audit::PgAuditStore;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub id: Uuid,
@@ -28,6 +31,8 @@ pub enum AuditOutcome {
 pub struct AuditLogger {
     entries: Arc<RwLock<VecDeque<AuditEntry>>>,
     max_entries: usize,
+    #[cfg(feature = "postgres")]
+    pg_store: Option<Arc<PgAuditStore>>,
 }
 
 impl AuditLogger {
@@ -35,7 +40,16 @@ impl AuditLogger {
         Self {
             entries: Arc::new(RwLock::new(VecDeque::with_capacity(max_entries))),
             max_entries,
+            #[cfg(feature = "postgres")]
+            pg_store: None,
         }
+    }
+
+    /// Attach a Postgres store for persistent dual-write.
+    #[cfg(feature = "postgres")]
+    pub fn with_pg(mut self, store: Arc<PgAuditStore>) -> Self {
+        self.pg_store = Some(store);
+        self
     }
 
     pub async fn log(&self, entry: AuditEntry) {
@@ -45,6 +59,20 @@ impl AuditLogger {
             resource = %entry.resource,
             "Audit log"
         );
+
+        // Postgres write (background task — never blocks the caller)
+        #[cfg(feature = "postgres")]
+        if let Some(store) = &self.pg_store {
+            let store = store.clone();
+            let entry_clone = entry.clone();
+            tokio::spawn(async move {
+                if let Err(e) = store.record(&entry_clone).await {
+                    tracing::warn!(error = %e, "Audit log Postgres write failed");
+                }
+            });
+        }
+
+        // In-memory ring buffer
         let mut entries = self.entries.write().await;
         if entries.len() >= self.max_entries {
             entries.pop_front();

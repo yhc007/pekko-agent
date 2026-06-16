@@ -42,7 +42,8 @@ use pekko_agent_orchestrator::{
 use pekko_agent_orchestrator::saga::{SagaDefinition, SagaResult};
 use pekko_agent_events::{AgentEventEnvelope, EventPublisher, event_types};
 use pekko_agent_security::{
-    AuditLogger, AuditEntry, AuditOutcome, Claims, JwtError, JwtManager, RbacManager,
+    AuditLogger, AuditEntry, AuditOutcome, AuditQuery, PgAuditStore,
+    Claims, JwtError, JwtManager, RbacManager,
     RateLimiter, RateLimitConfig,
 };
 use pekko_actor::{CircuitBreaker, CircuitBreakerBuilder};
@@ -78,6 +79,7 @@ pub(crate) struct AppState {
     pub(crate) rate_limiter:       Arc<RateLimiter>,
     pub(crate) response_cache:     Option<Arc<ResponseCache>>,
     pub(crate) webhook_registry:   Option<Arc<WebhookRegistry>>,
+    pub(crate) pg_audit_store:     Arc<PgAuditStore>,
 }
 
 // ── JWT extractor ─────────────────────────────────────────────────────────────
@@ -1435,6 +1437,84 @@ async fn register_agent(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── Audit log handlers ────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AuditLogsQuery {
+    tenant_id: Option<String>,
+    agent_id:  Option<String>,
+    action:    Option<String>,
+    from:      Option<chrono::DateTime<chrono::Utc>>,
+    to:        Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default = "default_audit_limit")]
+    limit: i64,
+    #[serde(default)]
+    offset: i64,
+}
+fn default_audit_limit() -> i64 { 50 }
+
+/// GET /api/audit/logs — query the persistent audit log (requires audit.access)
+async fn audit_logs(
+    auth:           AuthUser,
+    State(state):   State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<AuditLogsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "audit.access").await?;
+
+    // Non-admin callers can only see their own tenant
+    let tenant_id = if auth.0.roles.contains(&"admin".to_string()) {
+        params.tenant_id.clone()
+    } else {
+        Some(auth.0.tenant_id.clone())
+    };
+
+    let q = AuditQuery {
+        tenant_id,
+        agent_id: params.agent_id.clone(),
+        action:   params.action.clone(),
+        from:     params.from,
+        to:       params.to,
+        limit:    params.limit.max(1).min(500),
+        offset:   params.offset.max(0),
+    };
+
+    let entries = state.pg_audit_store.query(&q).await
+        .map_err(|e| internal_error(format!("Audit query failed: {e}")))?;
+
+    let total = state.pg_audit_store.count(&q).await
+        .map_err(|e| internal_error(format!("Audit count failed: {e}")))?;
+
+    Ok(Json(serde_json::json!({
+        "total":   total,
+        "limit":   params.limit,
+        "offset":  params.offset,
+        "entries": entries,
+    })))
+}
+
+/// GET /api/audit/stats — action summary for the caller's tenant (requires audit.access)
+async fn audit_stats(
+    auth:         AuthUser,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    require_permission(&state, &auth.0, "audit.access").await?;
+
+    let summary = state.pg_audit_store
+        .action_summary(&auth.0.tenant_id, 20)
+        .await
+        .map_err(|e| internal_error(format!("Audit stats failed: {e}")))?;
+
+    let breakdown: serde_json::Value = summary.into_iter()
+        .map(|(action, count)| serde_json::json!({ "action": action, "count": count }))
+        .collect::<Vec<_>>()
+        .into();
+
+    Ok(Json(serde_json::json!({
+        "tenant_id": auth.0.tenant_id,
+        "top_actions": breakdown,
+    })))
+}
+
 // ── Webhook handlers ──────────────────────────────────────────────────────────
 
 fn wh_registry<'a>(
@@ -1601,6 +1681,9 @@ pub(crate) fn build_router(state: AppState) -> axum::Router {
         .route("/api/cache/stats",                   get(cache_stats))
         .route("/api/cache/flush",                   axum::routing::delete(cache_flush_all))
         .route("/api/cache/flush/:agent_id",         axum::routing::delete(cache_flush_agent))
+        // ── Audit log ──
+        .route("/api/audit/logs",                    get(audit_logs))
+        .route("/api/audit/stats",                   get(audit_stats))
         // ── Webhook management ──
         .route("/api/webhooks",                      post(register_webhook).get(list_webhooks))
         .route("/api/webhooks/:id",                  axum::routing::delete(delete_webhook))
@@ -1873,9 +1956,17 @@ async fn main() -> anyhow::Result<()> {
     }
     info!(agents = agents.len(), "OrchestratorActor spawned in ActorSystem");
 
+    // ── Audit log persistence ─────────────────────────────────────────────────
+    PgAuditStore::migrate(&pg_pool).await
+        .expect("Audit log migration failed");
+    let pg_audit_store = Arc::new(PgAuditStore::new(pg_pool.clone()));
+    info!("Audit log store ready");
+
     // ── Infrastructure ────────────────────────────────────────────────────────
     let event_publisher = Arc::new(EventPublisher::new("pekko-agent", 1024));
-    let audit_logger    = Arc::new(AuditLogger::new(10000));
+    let audit_logger    = Arc::new(
+        AuditLogger::new(10000).with_pg(pg_audit_store.clone())
+    );
 
     // ── Webhook registry ──────────────────────────────────────────────────────
     WebhookRegistry::migrate(&pg_pool).await
@@ -1924,6 +2015,7 @@ async fn main() -> anyhow::Result<()> {
         rate_limiter,
         response_cache,
         webhook_registry: Some(webhook_registry.clone()),
+        pg_audit_store,
     };
 
     // ── Webhook bridge (background task) ─────────────────────────────────────
@@ -2011,6 +2103,10 @@ mod tests {
         PgConversationStore::migrate(&pg_pool).await
             .unwrap_or_else(|e| warn!("Migration note (may already exist): {e}"));
 
+        PgAuditStore::migrate(&pg_pool).await
+            .unwrap_or_else(|e| warn!("Audit migration note: {e}"));
+        let pg_audit_store = Arc::new(PgAuditStore::new(pg_pool.clone()));
+
         let jwt_manager = Arc::new(JwtManager::new(TEST_JWT_SECRET).with_ttl(3600));
 
         let mut api_keys_map: HashMap<String, ApiKeyEntry> = HashMap::new();
@@ -2081,6 +2177,7 @@ mod tests {
             rate_limiter,
             response_cache:   None,
             webhook_registry: None,
+            pg_audit_store,
         };
 
         build_router(state)

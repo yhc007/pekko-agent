@@ -12,7 +12,7 @@ pekko-agent-tools = { path = "../../crates/pekko-agent-tools" }
 pekko-agent-memory = { path = "../../crates/pekko-agent-memory" }
 pekko-agent-orchestrator = { path = "../../crates/pekko-agent-orchestrator" }
 pekko-agent-events = { path = "../../crates/pekko-agent-events" }
-pekko-agent-security = { path = "../../crates/pekko-agent-security" }
+pekko-agent-security = { path = "../../crates/pekko-agent-security", features = ["postgres"] }
 pekko-agent-observability = { path = "../../crates/pekko-agent-observability" }
 pekko-agent-cache    = { path = "../../crates/pekko-agent-cache" }
 pekko-agent-webhooks = { path = "../../crates/pekko-agent-webhooks" }
