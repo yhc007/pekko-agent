@@ -2033,6 +2033,11 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string()),
         max_tokens: std::env::var("CLAUDE_MAX_TOKENS")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(4096),
+        // Allow pointing the Anthropic-compatible client at a local endpoint
+        // (e.g. a self-hosted model serving /v1/messages). Defaults to the
+        // public API, so existing deployments are unaffected.
+        base_url: std::env::var("CLAUDE_BASE_URL")
+            .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),
         ..LlmConfig::default()
     };
 
