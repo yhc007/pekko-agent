@@ -68,13 +68,23 @@ impl ApiKeyStore {
                 created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 expires_at   TIMESTAMPTZ,
                 last_used_at TIMESTAMPTZ
-            );
-            CREATE INDEX IF NOT EXISTS pekko_api_keys_tenant_active
-                ON pekko_api_keys (tenant_id, active);
+            )
             "#,
         )
         .execute(pool)
         .await?;
+
+        // One statement per query(): sqlx uses the prepared-statement
+        // protocol, which Postgres rejects for multi-command strings.
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS pekko_api_keys_tenant_active
+                ON pekko_api_keys (tenant_id, active)
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
         Ok(())
     }
 
