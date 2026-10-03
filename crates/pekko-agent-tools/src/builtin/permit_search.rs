@@ -176,35 +176,54 @@ impl Tool for PermitSearchTool {
 mod tests {
     use super::*;
 
-    fn dummy_pool() -> Arc<PgPool> {
-        // 단위 테스트에서는 실제 연결 없이 정의만 검증
-        unsafe { Arc::from_raw(std::ptr::NonNull::dangling().as_ptr()) }
+    /// 연결을 열지 않는 풀. `connect_lazy`는 URL만 파싱하고 실제 접속은
+    /// 첫 쿼리까지 미루므로, DB를 건드리지 않는 검사에는 그대로 쓸 수 있다.
+    /// 다만 풀이 유지 태스크를 spawn하므로 호출부는 Tokio 런타임 안이어야 한다
+    /// (그래서 아래 테스트는 `#[tokio::test]`).
+    fn offline_pool() -> Arc<PgPool> {
+        Arc::new(
+            PgPool::connect_lazy("postgres://localhost/unused")
+                .expect("lazy pool should not need a server"),
+        )
     }
 
-    #[test]
-    fn test_definition() {
-        // PermitSearchTool은 pool이 필요하므로 정의만 확인
-        // (실제 DB 테스트는 integration test에서)
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": { "type": "string" }
-            },
-            "required": ["query"]
-        });
-        assert_eq!(schema["required"][0], "query");
+    fn tool() -> PermitSearchTool {
+        PermitSearchTool::new(offline_pool())
     }
 
-    #[test]
-    fn test_validate_empty_query() {
-        // validate_input은 pool 없이도 테스트 가능
-        let input = serde_json::json!({ "query": "" });
-        // pool을 사용하지 않으므로 안전하게 테스트
-        let pool = Arc::new(unsafe {
-            std::mem::ManuallyDrop::new(std::mem::zeroed::<PgPool>())
-        });
-        // 실제로는 validate_input이 pool을 사용하지 않음
-        drop(pool); // 실제 drop은 하지 않음 (zeroed memory)
-        assert!(input.get("query").and_then(|q| q.as_str()).map(|s| s.is_empty()).unwrap_or(true));
+    #[tokio::test]
+    async fn definition_describes_the_tool() {
+        let def = tool().definition();
+        assert_eq!(def.name, "permit_search");
+        assert!(def.idempotent);
+        assert_eq!(def.input_schema["required"][0], "query");
+    }
+
+    #[tokio::test]
+    async fn query_is_required_and_non_empty() {
+        let t = tool();
+        assert!(t.validate_input(&serde_json::json!({ "query": "" })).is_err());
+        assert!(t.validate_input(&serde_json::json!({})).is_err());
+        assert!(t.validate_input(&serde_json::json!({ "query": 42 })).is_err());
+        assert!(t.validate_input(&serde_json::json!({ "query": "보일러" })).is_ok());
+    }
+
+    #[tokio::test]
+    async fn limit_must_be_within_bounds() {
+        let t = tool();
+        for bad in [0, 101, -1] {
+            assert!(
+                t.validate_input(&serde_json::json!({ "query": "x", "limit": bad }))
+                    .is_err(),
+                "limit={bad} should be rejected"
+            );
+        }
+        for good in [1, 50, 100] {
+            assert!(
+                t.validate_input(&serde_json::json!({ "query": "x", "limit": good }))
+                    .is_ok(),
+                "limit={good} should be accepted"
+            );
+        }
     }
 }
