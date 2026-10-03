@@ -34,14 +34,22 @@ impl OrchestratorPersistence {
                 info       JSONB       NOT NULL,
                 profile    JSONB       NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
 
+        // One statement per query(): sqlx uses the prepared-statement
+        // protocol, which Postgres rejects for multi-command strings.
+        sqlx::query(
+            r#"
             CREATE TABLE IF NOT EXISTS pekko_workflow_runs (
                 workflow_id UUID        PRIMARY KEY,
                 data        JSONB       NOT NULL,
                 status      TEXT        NOT NULL,
                 updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
+            )
             "#,
         )
         .execute(pool)

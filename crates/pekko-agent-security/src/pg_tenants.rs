@@ -98,12 +98,22 @@ impl PgTenantStore {
                 active                  BOOLEAN     NOT NULL DEFAULT TRUE,
                 created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS pekko_tenants_active ON pekko_tenants (active);
+            )
             "#,
         )
         .execute(pool)
         .await?;
+
+        // One statement per query(): sqlx uses the prepared-statement
+        // protocol, which Postgres rejects for multi-command strings.
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS pekko_tenants_active ON pekko_tenants (active)
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
         Ok(())
     }
 
