@@ -90,11 +90,52 @@ fn superscript_digit(c: char) -> Option<char> {
     })
 }
 
+/// Remove parentheses that wrap the whole expression, repeatedly.
+///
+/// SymPy reads them as grouping, so `(c)` and `c` are the same symbol. Only
+/// a paren whose match is the final character is stripped, which leaves
+/// `(a+5)(b+2)` and `(3)/(4)` untouched.
+fn strip_redundant_parens(s: &str) -> String {
+    let mut cur = s;
+    loop {
+        let bytes = cur.as_bytes();
+        if bytes.len() < 2 || bytes[0] != b'(' || bytes[bytes.len() - 1] != b')' {
+            break;
+        }
+        let mut depth = 0usize;
+        let mut matches_last = false;
+        for (i, c) in cur.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        matches_last = i == cur.len() - 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !matches_last {
+            break;
+        }
+        cur = &cur[1..cur.len() - 1];
+    }
+    cur.to_string()
+}
+
 /// Drop whitespace adjacent to an operator so `6 + 9i` and `6+9i` compare
 /// equal. Whitespace between two operands is left alone: `1 2` must not
 /// become `12`, nor `sin x` become `sinx`.
 fn squeeze_operator_whitespace(s: &str) -> String {
     RE_WS_AROUND_OP.replace_all(s, "$1").into_owned()
+}
+
+/// The spelling-insensitive form used for string comparison: operator spacing
+/// squeezed out and wrapping parentheses removed.
+fn canonical_form(s: &str) -> String {
+    strip_redundant_parens(&squeeze_operator_whitespace(s))
 }
 
 fn convert_superscripts(s: &str) -> String {
@@ -276,8 +317,9 @@ pub fn split_into_parts(text: &str) -> Vec<String> {
 
 /// Are two normalized expressions the same answer?
 ///
-/// Exact string equality first, then the same comparison with whitespace
-/// around operators removed, then numeric evaluation of both sides.
+/// Exact string equality first, then the same comparison on a canonical form
+/// (operator spacing squeezed, wrapping parentheses dropped), then numeric
+/// evaluation of both sides.
 ///
 /// This replaces the original's SymPy step and is deliberately narrower.
 /// Covered: integers, decimals, fractions, `sqrt`, powers, parentheses and
@@ -292,9 +334,10 @@ pub fn equality_check(gt: &str, pred: &str) -> bool {
     if gt == pred {
         return true;
     }
-    // SymPy's parser ignores whitespace around operators; normalize_text keeps
-    // it, so compare again with it squeezed out before giving up on strings.
-    if squeeze_operator_whitespace(gt) == squeeze_operator_whitespace(pred) {
+    // SymPy's parser ignores whitespace around operators and treats a wrapping
+    // paren as grouping; normalize_text preserves both, so retry the string
+    // comparison on a canonical form before giving up on strings.
+    if canonical_form(gt) == canonical_form(pred) {
         return true;
     }
     match (eval_expr(gt), eval_expr(pred)) {
@@ -784,6 +827,27 @@ mod tests {
         assert!(grade_answer("6r^2 -4r -24", "6r^2-4r-24"));
         assert!(grade_answer("(a + 5)(b + 2)", "(a+5)(b+2)"));
         assert!(grade_answer(r"137\frac{1}{2}", r"137 \frac{1}{2}"));
+    }
+
+    #[test]
+    fn wrapping_parentheses_are_grouping() {
+        // SymPy parses (c) as the symbol c, so a multiple-choice answer
+        // spelled either way is the same answer.
+        assert!(grade_answer("C", r"\text{(C)}"));
+        assert!(grade_answer("E", r"\text{(E)}"));
+        assert!(grade_answer("(x)", "x"));
+        assert!(grade_answer("((x))", "x"));
+
+        // Only a paren matching the final character is redundant.
+        assert_eq!(strip_redundant_parens("(a+5)(b+2)"), "(a+5)(b+2)");
+        assert_eq!(strip_redundant_parens("(3)/(4)"), "(3)/(4)");
+        assert_eq!(strip_redundant_parens("sqrt(2)"), "sqrt(2)");
+        assert_eq!(strip_redundant_parens("(a+(b))"), "a+(b)");
+        assert_eq!(strip_redundant_parens("(x"), "(x");
+
+        // Distinct answers must stay distinct.
+        assert!(!grade_answer("C", r"\text{(D)}"));
+        assert!(!grade_answer("(a+5)(b+2)", "(a+5)(b+3)"));
     }
 
     #[test]
