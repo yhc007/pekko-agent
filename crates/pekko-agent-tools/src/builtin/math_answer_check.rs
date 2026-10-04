@@ -48,6 +48,21 @@ static RE_MIXED_NUMBER: LazyLock<Regex> =
 static RE_THOUSANDS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(\d),(\d{3})(\D|$)").unwrap());
 
+/// Whitespace touching an arithmetic operator or bracket. The comma is
+/// deliberately absent: an operator already separates its operands, so
+/// dropping space around one cannot merge two tokens, whereas `-2, 1` and
+/// `-2,1` are a comma list that SymPy refuses to parse — treating those as
+/// equal would claim an equivalence the reference rejects.
+static RE_WS_AROUND_OP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\s*([+\-*/^()=<>|])\s*").unwrap());
+
+/// Two numbers separated only by whitespace, e.g. `1 2`. SymPy refuses to
+/// parse that, so the evaluator must not silently join them into `12`.
+/// Deliberately limited to digits: `3 sqrt(5)` is implicit multiplication,
+/// which SymPy does evaluate, so that must still be allowed through.
+static RE_OPERAND_GAP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[0-9]\s+[0-9]").unwrap());
+
 /// Applied in order; each entry is (pattern, replacement).
 static LATEX_FIXES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     [
@@ -73,6 +88,13 @@ fn superscript_digit(c: char) -> Option<char> {
         '⁺' => '+', '⁻' => '-', '⁽' => '(', '⁾' => ')',
         _ => return None,
     })
+}
+
+/// Drop whitespace adjacent to an operator so `6 + 9i` and `6+9i` compare
+/// equal. Whitespace between two operands is left alone: `1 2` must not
+/// become `12`, nor `sin x` become `sinx`.
+fn squeeze_operator_whitespace(s: &str) -> String {
+    RE_WS_AROUND_OP.replace_all(s, "$1").into_owned()
 }
 
 fn convert_superscripts(s: &str) -> String {
@@ -254,7 +276,8 @@ pub fn split_into_parts(text: &str) -> Vec<String> {
 
 /// Are two normalized expressions the same answer?
 ///
-/// Exact string equality first, then numeric evaluation of both sides.
+/// Exact string equality first, then the same comparison with whitespace
+/// around operators removed, then numeric evaluation of both sides.
 ///
 /// This replaces the original's SymPy step and is deliberately narrower.
 /// Covered: integers, decimals, fractions, `sqrt`, powers, parentheses and
@@ -267,6 +290,11 @@ pub fn split_into_parts(text: &str) -> Vec<String> {
 /// an equivalence, but it never reports one that does not hold.
 pub fn equality_check(gt: &str, pred: &str) -> bool {
     if gt == pred {
+        return true;
+    }
+    // SymPy's parser ignores whitespace around operators; normalize_text keeps
+    // it, so compare again with it squeezed out before giving up on strings.
+    if squeeze_operator_whitespace(gt) == squeeze_operator_whitespace(pred) {
         return true;
     }
     match (eval_expr(gt), eval_expr(pred)) {
@@ -315,6 +343,12 @@ const MAX_EXPR_LEN: usize = 2000;
 
 fn eval_expr(s: &str) -> Option<f64> {
     if s.is_empty() || s.len() > MAX_EXPR_LEN {
+        return None;
+    }
+    // Whitespace is dropped below, which would turn `1 2` into `12`. SymPy
+    // treats that as a parse error rather than a number, so refuse it here
+    // instead of inventing a value.
+    if RE_OPERAND_GAP.is_match(s) {
         return None;
     }
     let chars: Vec<char> = s.chars().filter(|c| !c.is_whitespace()).collect();
@@ -740,6 +774,30 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_around_operators_is_ignored() {
+        // SymPy's parser ignores this spacing, so these are real equivalences
+        // the string comparison would otherwise miss. All have free variables
+        // or an imaginary unit, so numeric evaluation cannot rescue them.
+        assert!(grade_answer("6 + 9i", "6+9i"));
+        assert!(grade_answer("2k + 2", "2k+2"));
+        assert!(grade_answer("x^3 + 3x - 6", "x^3+3x-6"));
+        assert!(grade_answer("6r^2 -4r -24", "6r^2-4r-24"));
+        assert!(grade_answer("(a + 5)(b + 2)", "(a+5)(b+2)"));
+        assert!(grade_answer(r"137\frac{1}{2}", r"137 \frac{1}{2}"));
+    }
+
+    #[test]
+    fn whitespace_between_operands_is_significant() {
+        // No operator separates these, so squeezing would merge two tokens
+        // into one and claim an equivalence the reference rejects.
+        assert!(!grade_answer("1 2", "12"));
+        assert!(!grade_answer("sin x", "sinx"));
+        // A bare comma list is not a tuple (no brackets) and SymPy will not
+        // parse it, so the reference says these differ.
+        assert!(!grade_answer("-2, 1", "-2,1"));
+    }
+
+    #[test]
     fn free_variables_fall_back_to_string_equality() {
         // Identical spellings still match.
         assert!(grade_answer("2x", "2x"));
@@ -759,6 +817,11 @@ mod tests {
         assert_eq!(eval_expr(""), None);
         assert_eq!(eval_expr(&"1".repeat(MAX_EXPR_LEN + 1)), None);
         assert_eq!(eval_expr("1/0"), None);
+        // `1 2` must not be read as 12.
+        assert_eq!(eval_expr("1 2"), None);
+        assert_eq!(eval_expr("12"), Some(12.0));
+        // ...but implicit multiplication across a space still evaluates.
+        assert!(eval_expr("3 sqrt(4)").is_some_and(|v| (v - 6.0).abs() < 1e-9));
     }
 
     #[tokio::test]
