@@ -178,15 +178,40 @@ pub fn extract_final_candidate(text: &str, fallback: Fallback) -> String {
     }
 
     match fallback {
-        Fallback::NumberThenFull | Fallback::NumberOnly => {
-            match RE_NUMBER.find_iter(text).last() {
-                Some(m) => m.as_str().to_string(),
-                None if fallback == Fallback::NumberThenFull => text.to_string(),
-                None => String::new(),
-            }
-        }
+        Fallback::NumberThenFull | Fallback::NumberOnly => match last_number(text) {
+            Some(m) => m.to_string(),
+            None if fallback == Fallback::NumberThenFull => text.to_string(),
+            None => String::new(),
+        },
         Fallback::None => String::new(),
     }
+}
+
+/// Could this byte be part of a `RE_NUMBER` match?
+fn is_number_byte(c: u8) -> bool {
+    c.is_ascii_digit() || matches!(c, b'-' | b'+' | b'.' | b'/' | b'e' | b'E')
+}
+
+/// The last `RE_NUMBER` match, without enumerating the earlier ones.
+///
+/// `find_iter(text).last()` walks every number in the response to report the
+/// trailing one, which dominates extraction for the ~39% of outputs that carry
+/// no `\boxed{...}`. Two facts make a bounded search give the same answer:
+/// a lone digit is itself a match, so the final match must contain the last
+/// digit; and a match is built only from the bytes above, so it cannot reach
+/// back across one that is not. Searching back to the nearest such byte
+/// therefore starts where no earlier match can still be open, and the scan
+/// over that suffix yields exactly the match the full pass would.
+fn last_number(text: &str) -> Option<&str> {
+    let b = text.as_bytes();
+    // Continuation bytes are >= 0x80, so this cannot land inside a character.
+    let last_digit = b.iter().rposition(u8::is_ascii_digit)?;
+    let mut start = last_digit;
+    while start > 0 && is_number_byte(b[start - 1]) {
+        start -= 1;
+    }
+    // Every byte stepped over is ASCII, so `start` is a character boundary.
+    RE_NUMBER.find_iter(&text[start..]).last().map(|m| m.as_str())
 }
 
 // ── Normalization ───────────────────────────────────────────────────────────
@@ -1063,6 +1088,60 @@ mod tests {
                 "input: {input:?}"
             );
         }
+    }
+
+    #[test]
+    fn bounded_last_number_matches_a_full_scan() {
+        // The bounded search must agree with enumerating every match, which is
+        // what the reference does. These are the shapes where a naive scan
+        // backwards from the end would disagree.
+        let cases: &[(&str, Option<&str>)] = &[
+            ("answer: 42", Some("42")),
+            ("1 then 2 then 3", Some("3")),
+            // A trailing exponent must not be read as a bare number.
+            ("value 1.5e10", Some("1.5e10")),
+            ("value 1.5E-10", Some("1.5E-10")),
+            // A fraction is one match, not two.
+            ("ratio 3/4", Some("3/4")),
+            ("a 1/2 b 5/6", Some("5/6")),
+            // A minus sign belongs to the following number only when free.
+            ("x-1", Some("-1")),
+            ("9-1", Some("-1")),
+            ("-7", Some("-7")),
+            // A letter that is also an exponent marker must not confuse it.
+            ("the5", Some("5")),
+            ("1e5e7", Some("7")),
+            // Trailing non-numeric text is skipped.
+            ("12345 units", Some("12345")),
+            ("3.25.", Some("3.25")),
+            ("no digits here", None),
+            ("", None),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(last_number(text), *expected, "input: {text:?}");
+            // ...and the bounded result is the full scan's result.
+            assert_eq!(
+                last_number(text),
+                RE_NUMBER.find_iter(text).last().map(|m| m.as_str()),
+                "bounded search disagreed with the full scan on {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_search_agrees_on_long_responses() {
+        // A realistic shape: a long chain of reasoning, numbers throughout,
+        // no \boxed{...} at the end.
+        let mut text = String::new();
+        for i in 0..400 {
+            text.push_str(&format!("step {i}: carry {}/{} then ", i + 1, i + 2));
+        }
+        text.push_str("so the value is -12.5e3 at last");
+        assert_eq!(
+            last_number(&text),
+            RE_NUMBER.find_iter(&text).last().map(|m| m.as_str())
+        );
+        assert_eq!(last_number(&text), Some("-12.5e3"));
     }
 
     #[test]
