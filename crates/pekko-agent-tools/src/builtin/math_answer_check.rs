@@ -29,25 +29,6 @@ static RE_DEG_BRACED: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\^\s*\{\s*\\circ\s*\}").unwrap());
 static RE_DEG_BARE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\^\s*\\circ").unwrap());
 static RE_TEXT_WRAP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\\text\{(.+?)\}$").unwrap());
-static RE_MATH_DELIM: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\\\(|\\\)|\\\[|\\\]").unwrap());
-static RE_SUP_WITH_BASE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"([0-9A-Za-z\)\]\}])([⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻]+)").unwrap());
-static RE_SQRT_BRACED: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\\sqrt\s*\{([^}]*)\}").unwrap());
-static RE_SQRT_BARE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\\sqrt\s+([^\\\s{}]+)").unwrap());
-static RE_FRAC_BRACED: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}").unwrap());
-static RE_FRAC_BARE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\\frac\s+([^\s{}]+)\s+([^\s{}]+)").unwrap());
-// The original uses lookbehind/lookahead, which the regex crate does not
-// support; these capture the context and re-emit it instead.
-static RE_MIXED_NUMBER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(\d)\s+(\d+/\d+)").unwrap());
-static RE_THOUSANDS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(\d),(\d{3})(\D|$)").unwrap());
-
 /// Whitespace touching an arithmetic operator or bracket. The comma is
 /// deliberately absent: an operator already separates its operands, so
 /// dropping space around one cannot merge two tokens, whereas `-2, 1` and
@@ -62,24 +43,6 @@ static RE_WS_AROUND_OP: LazyLock<Regex> =
 /// which SymPy does evaluate, so that must still be allowed through.
 static RE_OPERAND_GAP: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[0-9]\s+[0-9]").unwrap());
-
-/// Applied in order; each entry is (pattern, replacement).
-static LATEX_FIXES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
-    [
-        (r"\\left\s*", ""),
-        (r"\\right\s*", ""),
-        (r"\\,|\\!|\;|\\:", ""),
-        (r"\\cdot", "*"),
-        (r"\u{00B7}|\u{00D7}", "*"),
-        (r"\\\^\\circ", ""),
-        (r"\\dfrac", r"\frac"),
-        (r"\\tfrac", r"\frac"),
-        (r"°", ""),
-    ]
-    .into_iter()
-    .map(|(p, r)| (Regex::new(p).unwrap(), r))
-    .collect()
-});
 
 fn superscript_digit(c: char) -> Option<char> {
     Some(match c {
@@ -138,10 +101,6 @@ fn canonical_form(s: &str) -> String {
     strip_redundant_parens(&squeeze_operator_whitespace(s))
 }
 
-fn convert_superscripts(s: &str) -> String {
-    s.chars().map(|c| superscript_digit(c).unwrap_or(c)).collect()
-}
-
 // ── Extraction ──────────────────────────────────────────────────────────────
 
 /// Content of the last `\boxed{...}`, honouring brace nesting.
@@ -150,27 +109,37 @@ fn convert_superscripts(s: &str) -> String {
 /// the braces never balance.
 pub fn get_last_boxed(text: &str) -> Option<String> {
     const MARKER: &str = r"\boxed";
-    let chars: Vec<char> = text.chars().collect();
+    let bytes = text.as_bytes();
 
-    // rfind on bytes is safe here: MARKER is ASCII, so the byte offset lands on
-    // a char boundary. Convert it to a char index to scan forward.
-    let byte_idx = text.rfind(MARKER)?;
-    let mut i = text[..byte_idx].chars().count() + MARKER.chars().count();
+    // rfind is a backward byte scan and lands on a char boundary because
+    // MARKER is ASCII. Everything below walks bytes from there, so a long
+    // response is never decoded or copied just to locate its last answer.
+    let start = text.rfind(MARKER)?;
+    let mut i = start + MARKER.len();
 
-    while i < chars.len() && chars[i].is_whitespace() {
-        i += 1;
+    // Whitespace may be non-ASCII, so decode — but only the few chars here.
+    for c in text[i..].chars() {
+        if c.is_whitespace() {
+            i += c.len_utf8();
+        } else {
+            break;
+        }
     }
-    if i >= chars.len() || chars[i] != '{' {
+
+    if bytes.get(i) != Some(&b'{') {
         return None;
     }
-
     i += 1;
     let content_start = i;
+
+    // `{` and `}` are ASCII, which UTF-8 never produces as a continuation
+    // byte, so counting depth over raw bytes cannot mis-fire inside a
+    // multi-byte character.
     let mut depth = 1usize;
-    while i < chars.len() && depth > 0 {
-        match chars[i] {
-            '{' => depth += 1,
-            '}' => depth -= 1,
+    while i < bytes.len() && depth > 0 {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
             _ => {}
         }
         i += 1;
@@ -178,7 +147,9 @@ pub fn get_last_boxed(text: &str) -> Option<String> {
     if depth != 0 {
         return None;
     }
-    Some(chars[content_start..i - 1].iter().collect())
+
+    // Both ends sit just inside ASCII braces, so these are char boundaries.
+    Some(text[content_start..i - 1].to_string())
 }
 
 /// What to do when the text contains no `\boxed{...}`.
@@ -223,72 +194,408 @@ pub fn extract_final_candidate(text: &str, fallback: Fallback) -> String {
 /// Canonicalize an answer string so two spellings of the same value compare
 /// equal: strips chat tokens, math delimiters and degree markers, rewrites
 /// `\frac`/`\sqrt`/superscripts into plain arithmetic, and lowercases.
+///
+/// The original applies ~20 regex substitutions in sequence, each scanning and
+/// reallocating the whole string. This folds the local rewrites into one
+/// character pass. Three things cannot move into it, because the reference's
+/// ordering is observable:
+///
+/// * the multiple-choice and `\text{...}` unwraps are anchored to the whole
+///   string, and degree removal runs between them, so `\text{x}^\circ`
+///   unwraps while `\text{x}b` does not;
+/// * the mixed-number and thousands rules apply to the *rewritten* text, so
+///   they run afterwards over the (much shorter) output.
+///
+/// Each of those is guarded by a cheap `contains` check, so the common case —
+/// a short expression with no chat token, label or degree marker — reaches the
+/// main pass directly.
 pub fn normalize_text(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
 
-    let mut s = RE_SPECIAL.replace_all(text, "").trim().to_string();
+    // ── anchored pre-steps, each skipped unless its marker is present ──
+    let stripped;
+    let mut s = if text.contains("<|") {
+        stripped = RE_SPECIAL.replace_all(text, "").into_owned();
+        stripped.trim()
+    } else {
+        text.trim()
+    };
 
     // "c. 3" -> "3"
-    if let Some(c) = RE_MC_LABEL.captures(&s) {
-        s = c[1].to_string();
+    let mc;
+    if s.as_bytes().first().is_some_and(|c| c.is_ascii_alphabetic()) {
+        if let Some(c) = RE_MC_LABEL.captures(s) {
+            mc = c[1].to_string();
+            s = &mc;
+        }
     }
 
-    s = RE_DEG_BRACED.replace_all(&s, "").into_owned();
-    s = RE_DEG_BARE.replace_all(&s, "").into_owned();
-    s = s.replace('°', "");
+    let degreeless;
+    if s.contains("circ") || s.contains('°') {
+        let t = RE_DEG_BRACED.replace_all(s, "");
+        let t = RE_DEG_BARE.replace_all(&t, "");
+        degreeless = t.replace('°', "");
+        s = &degreeless;
+    }
 
     // Unwrap \text{...} only when it wraps the entire string.
-    if let Some(c) = RE_TEXT_WRAP.captures(&s) {
-        s = c[1].to_string();
+    let unwrapped;
+    if s.starts_with("\\text{") && s.ends_with('}') {
+        if let Some(c) = RE_TEXT_WRAP.captures(s) {
+            unwrapped = c[1].to_string();
+            s = &unwrapped;
+        }
     }
 
-    s = RE_MATH_DELIM.replace_all(&s, "").into_owned();
+    // ── the single pass ──
+    let mut out = String::with_capacity(s.len() + 8);
+    normalize_body(s, &mut out);
 
-    for (pat, rep) in LATEX_FIXES.iter() {
-        s = pat.replace_all(&s, *rep).into_owned();
+    // ── fractions and leftover braces ──
+    let out = if out.contains('{') || out.contains('}') || out.contains("frac") {
+        apply_fractions(&out)
+    } else {
+        out
+    };
+
+    // ── digit grouping, over the rewritten text ──
+    let out = if out.as_bytes().iter().any(|c| *c == b',' || c.is_ascii_whitespace()) {
+        fix_digit_groups(&out)
+    } else {
+        out
+    };
+
+    let t = out.trim();
+    if t.len() == out.len() {
+        out
+    } else {
+        t.to_string()
     }
+}
 
-    // 2² -> 2**2, then any stray superscripts on their own.
-    s = RE_SUP_WITH_BASE
-        .replace_all(&s, |c: &regex::Captures| {
-            format!("{}**{}", &c[1], convert_superscripts(&c[2]))
-        })
-        .into_owned();
-    s = convert_superscripts(&s);
+/// Can a unicode superscript attach to this character as its base?
+fn is_superscript_base(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, ')' | ']' | '}')
+}
 
-    s = s.replace("\\%", "%").replace(['$', '%'], "");
+/// The character ending at byte `i`.
+fn char_before(s: &str, i: usize) -> Option<char> {
+    s[..i].chars().next_back()
+}
 
-    s = RE_SQRT_BRACED
-        .replace_all(&s, |c: &regex::Captures| format!("sqrt({})", &c[1]))
-        .into_owned();
-    s = RE_SQRT_BARE
-        .replace_all(&s, |c: &regex::Captures| format!("sqrt({})", &c[1]))
-        .into_owned();
+/// Walk `s` once, appending the canonical form to `out`.
+///
+/// Recurses into `\frac` and `\sqrt` arguments, writing into the same buffer,
+/// so nothing is allocated per group.
+fn normalize_body(s: &str, out: &mut String) {
+    let b = s.as_bytes();
+    let mut i = 0;
 
-    s = RE_FRAC_BRACED
-        .replace_all(&s, |c: &regex::Captures| format!("({})/({})", &c[1], &c[2]))
-        .into_owned();
-    s = RE_FRAC_BARE
-        .replace_all(&s, |c: &regex::Captures| format!("({})/({})", &c[1], &c[2]))
-        .into_owned();
+    while i < b.len() {
+        let c = b[i];
 
-    s = s.replace('^', "**");
+        // multi-byte: superscripts, degree sign, multiplication dots
+        if c >= 0x80 {
+            let ch = s[i..].chars().next().unwrap();
+            if let Some(d) = superscript_digit(ch) {
+                // The reference inserts ** once per run, when a base precedes it.
+                if char_before(s, i).is_some_and(is_superscript_base) {
+                    out.push_str("**");
+                }
+                out.push(d);
+                i += ch.len_utf8();
+                while let Some(next) = s[i..].chars().next() {
+                    match superscript_digit(next) {
+                        Some(d2) => {
+                            out.push(d2);
+                            i += next.len_utf8();
+                        }
+                        None => break,
+                    }
+                }
+            } else if ch == '°' {
+                i += ch.len_utf8();
+            } else if ch == '\u{00B7}' || ch == '\u{00D7}' {
+                out.push('*');
+                i += ch.len_utf8();
+            } else {
+                out.extend(ch.to_lowercase());
+                i += ch.len_utf8();
+            }
+            continue;
+        }
 
-    // "1 1/2" -> "1+1/2"
-    s = RE_MIXED_NUMBER.replace_all(&s, "${1}+${2}").into_owned();
+        match c {
+            b'\\' => match handle_command(s, i, out) {
+                Some(adv) => i += adv,
+                None => {
+                    out.push('\\');
+                    i += 1;
+                }
+            },
+            // ^{\circ} and ^\circ are gone by now, so any caret is an exponent.
+            b'^' => {
+                out.push_str("**");
+                i += 1;
+            }
+            // \% became %, and both % and $ are dropped. Braces survive this
+            // pass: the fraction rule needs them, and it runs next.
+            b'$' | b'%' => i += 1,
+            _ => {
+                out.push(c.to_ascii_lowercase() as char);
+                i += 1;
+            }
+        }
+    }
+}
 
-    // "1,234,567" -> "1234567"; repeat because matches overlap on the separator.
-    loop {
-        let next = RE_THOUSANDS.replace_all(&s, "${1}${2}${3}").into_owned();
-        if next == s {
+/// Skip ASCII and unicode whitespace from `i`, returning the new offset.
+fn skip_ws(s: &str, mut i: usize) -> usize {
+    while let Some(c) = s[i..].chars().next() {
+        if c.is_whitespace() {
+            i += c.len_utf8();
+        } else {
             break;
         }
-        s = next;
+    }
+    i
+}
+
+/// A `{...}` group whose body may not contain braces, as `[^{}]+` requires.
+fn flat_group(s: &str, i: usize) -> Option<(&str, usize)> {
+    let b = s.as_bytes();
+    if b.get(i) != Some(&b'{') {
+        return None;
+    }
+    let body_start = i + 1;
+    let mut j = body_start;
+    while j < b.len() && b[j] != b'{' && b[j] != b'}' {
+        j += 1;
+    }
+    if j == body_start || b.get(j) != Some(&b'}') {
+        return None; // empty, nested, or unterminated
+    }
+    Some((&s[body_start..j], j + 1))
+}
+
+/// A `{...}` group whose body may contain `{`, as `[^}]*` allows, and may be empty.
+fn loose_group(s: &str, i: usize) -> Option<(&str, usize)> {
+    let b = s.as_bytes();
+    if b.get(i) != Some(&b'{') {
+        return None;
+    }
+    let body_start = i + 1;
+    let mut j = body_start;
+    while j < b.len() && b[j] != b'}' {
+        j += 1;
+    }
+    if b.get(j) != Some(&b'}') {
+        return None;
+    }
+    Some((&s[body_start..j], j + 1))
+}
+
+/// A bare argument: one or more characters that are not a backslash, brace or space.
+fn bare_arg(s: &str, i: usize) -> Option<(&str, usize)> {
+    let b = s.as_bytes();
+    let mut j = i;
+    while j < b.len() {
+        let c = b[j];
+        if c == b'\\' || c == b'{' || c == b'}' || c.is_ascii_whitespace() {
+            break;
+        }
+        j += 1;
+    }
+    if j == i {
+        None
+    } else {
+        Some((&s[i..j], j))
+    }
+}
+
+/// The argument of `\sqrt`: a braced group first, as the reference tries,
+/// then a bare token.
+fn sqrt_arg(s: &str, after: usize) -> Option<(&str, usize)> {
+    let p = skip_ws(s, after);
+    if let Some(found) = loose_group(s, p) {
+        return Some(found);
+    }
+    if p == after {
+        return None; // the bare form requires whitespace
+    }
+    bare_arg(s, p)
+}
+
+/// Rewrite one LaTeX command at `i`, returning the bytes consumed.
+///
+/// `None` means this is not a command the reference rewrites, so the caller
+/// emits the backslash literally — matching the original, which leaves an
+/// unrecognised command in place.
+fn handle_command(s: &str, i: usize, out: &mut String) -> Option<usize> {
+    let rest = &s[i + 1..];
+
+    // Spacing commands and math delimiters: dropped outright.
+    for lit in ["left", "right"] {
+        if let Some(tail) = rest.strip_prefix(lit) {
+            let after = s.len() - tail.len();
+            return Some(skip_ws(s, after) - i);
+        }
+    }
+    for lit in [",", "!", ";", ":", "(", ")", "[", "]", "%"] {
+        if rest.starts_with(lit) {
+            return Some(1 + lit.len());
+        }
+    }
+    if rest.starts_with("cdot") {
+        out.push('*');
+        return Some(1 + 4);
     }
 
-    s.replace(['{', '}'], "").trim().to_lowercase()
+    // The fraction rules run after this pass, because SymPy's ordering is
+    // observable: \sqrt{21} loses its braces first, which is the only reason
+    // \frac{\sqrt{21}}{5} can match a rule whose groups reject braces.
+    // \dfrac and \tfrac are folded into \frac here, as the reference does.
+    for lit in ["dfrac", "tfrac"] {
+        if rest.starts_with(lit) {
+            out.push_str("\\frac");
+            return Some(1 + lit.len());
+        }
+    }
+
+    if rest.starts_with("sqrt") {
+        let after = i + 1 + 4;
+        // \sqrt{a} takes priority over \sqrt a
+        if let Some((body, end)) = sqrt_arg(s, after) {
+            out.push_str("sqrt(");
+            normalize_body(body, out);
+            out.push(')');
+            return Some(end - i);
+        }
+        out.push_str("\\sqrt");
+        return Some(1 + 4);
+    }
+
+    None
+}
+
+/// Rewrite `\frac` and drop any remaining braces.
+///
+/// Scans left to right and, on a `\frac` whose arguments do not match,
+/// advances one byte and keeps looking — the same way a single `re.sub` pass
+/// behaves, which is why `\frac{\frac{1}{2}}{3}` rewrites the inner fraction
+/// and leaves the outer one alone.
+fn apply_fractions(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+
+    while i < b.len() {
+        if b[i] == b'{' || b[i] == b'}' {
+            i += 1;
+            continue;
+        }
+        if b[i] == b'\\' && s[i + 1..].starts_with("frac") {
+            let after = i + 1 + 4;
+            let braced = (|| {
+                let p = skip_ws(s, after);
+                let (g1, p) = flat_group(s, p)?;
+                let p = skip_ws(s, p);
+                let (g2, p) = flat_group(s, p)?;
+                Some((g1, g2, p))
+            })();
+            let bare = || {
+                let p = skip_ws(s, after);
+                if p == after {
+                    return None; // the bare form requires whitespace
+                }
+                let (g1, p) = bare_arg(s, p)?;
+                let q = skip_ws(s, p);
+                if q == p {
+                    return None;
+                }
+                let (g2, p) = bare_arg(s, q)?;
+                Some((g1, g2, p))
+            };
+            if let Some((g1, g2, end)) = braced.or_else(bare) {
+                out.push('(');
+                out.push_str(g1);
+                out.push_str(")/(");
+                out.push_str(g2);
+                out.push(')');
+                i = end;
+                continue;
+            }
+        }
+        // Copy one character, not one byte, to keep UTF-8 intact.
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+/// Apply the two rules that read the rewritten text: a mixed number becomes a
+/// sum, and thousands separators are dropped.
+fn fix_digit_groups(s: &str) -> String {
+    let b = s.as_bytes();
+    // Only ASCII is inserted or removed, so the bytes stay valid UTF-8.
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+
+    while i < b.len() {
+        let c = b[i];
+        let prev_is_digit = out.last().is_some_and(u8::is_ascii_digit);
+
+        // "1,234" -> "1234", but only before exactly three digits.
+        if c == b',' && prev_is_digit {
+            let d = &b[i + 1..];
+            let three = d.len() >= 3 && d[..3].iter().all(u8::is_ascii_digit);
+            if three && (d.len() == 3 || !d[3].is_ascii_digit()) {
+                i += 1;
+                continue;
+            }
+        }
+
+        // "1 1/2" -> "1+1/2"
+        if c.is_ascii_whitespace() && prev_is_digit {
+            let ws_end = {
+                let mut j = i;
+                while j < b.len() && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                j
+            };
+            let num_end = {
+                let mut j = ws_end;
+                while j < b.len() && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                j
+            };
+            if num_end > ws_end && b.get(num_end) == Some(&b'/') {
+                let den_end = {
+                    let mut j = num_end + 1;
+                    while j < b.len() && b[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    j
+                };
+                if den_end > num_end + 1 {
+                    out.push(b'+');
+                    i = ws_end;
+                    continue;
+                }
+            }
+        }
+
+        out.push(c);
+        i += 1;
+    }
+
+    String::from_utf8(out).expect("only ASCII was added or removed")
 }
 
 /// Split `"(a, b)"` into its items so tuple answers compare element-wise.
