@@ -341,21 +341,22 @@ pub fn equality_check(gt: &str, pred: &str) -> bool {
         return true;
     }
     match (eval_expr(gt), eval_expr(pred)) {
-        (Some(a), Some(b)) => approx_eq(a, b),
+        (Some(a), Some(b)) => values_equal(a, b),
         _ => false,
     }
 }
 
-fn approx_eq(a: f64, b: f64) -> bool {
-    if !a.is_finite() || !b.is_finite() {
-        return false;
-    }
-    let diff = (a - b).abs();
-    if diff <= 1e-9 {
-        return true;
-    }
-    let scale = a.abs().max(b.abs());
-    diff <= 1e-9 * scale
+/// Do two evaluated expressions denote the same number?
+///
+/// Exact f64 comparison, with no tolerance. A tolerance would be unsound
+/// here: SymPy reads a decimal literal as exact, so `0.3333333333` is not
+/// `1/3` however many digits it carries, and any window wide enough to
+/// bridge that gap grades a truncated answer as correct. Measured against
+/// the reference, exact comparison loses nothing — two spellings of one
+/// value agree to the last bit (`sqrt(8)/2` and `sqrt(2)`, `(3)/(4)` and
+/// `0.75`, even `1/3+1/3+1/3` and `1`).
+fn values_equal(a: f64, b: f64) -> bool {
+    a.is_finite() && b.is_finite() && a == b
 }
 
 /// Decide whether `pred_text` answers the question as well as `gt_text`.
@@ -812,8 +813,22 @@ mod tests {
         assert!(grade_answer("(1,2)", "(1, 2)"));
 
         assert!(!grade_answer("(1,2)", "(2,1)"));
-        assert!(!grade_answer("1/3", "0.333"));
         assert!(!grade_answer("5", "6"));
+
+        // A decimal literal is exact to SymPy, so a truncated one is a
+        // different number however many digits it carries.
+        assert!(!grade_answer("1/3", "0.333"));
+        assert!(!grade_answer("0.3333333333", "1/3"));
+        assert!(!grade_answer("0.33333333333333", "1/3"));
+        // ...until it is the full f64 expansion, which SymPy also accepts.
+        assert!(grade_answer("0.3333333333333333", "1/3"));
+        // Exactly representable decimals match.
+        assert!(grade_answer("0.5", "1/2"));
+        assert!(grade_answer("0.75", r"\frac{3}{4}"));
+        assert!(grade_answer("2.0", "2"));
+        // Different spellings of one value agree to the last bit.
+        assert!(grade_answer("sqrt(8)/2", "sqrt(2)"));
+        assert!(grade_answer("1/3+1/3+1/3", "1"));
     }
 
     #[test]
