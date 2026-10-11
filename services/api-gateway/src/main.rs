@@ -2102,7 +2102,7 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("CB_RESET_TIMEOUT_SECS")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(60)
     );
-    let cb_max_failures: u32 = std::env::var("CB_MAX_FAILURES")
+    let cb_max_failures: u64 = std::env::var("CB_MAX_FAILURES")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(5);
 
     let make_cb = || {

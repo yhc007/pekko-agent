@@ -289,10 +289,10 @@ pub enum TaskExecutionStatus {
 
 // ─── pekko_actor::Actor impl ──────────────────────────────────────────────────
 
-impl Actor for OrchestratorActor {
-    type Message = OrchestratorMessage;
-
-    fn pre_start(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+// Actor 메서드 본문 — 아래 #[async_trait] impl Actor가 위임 호출
+// (pekko_actor::Actor는 #[async_trait] trait이라 Pin<Box<..>> 수동 반환 시그니처와 불일치)
+impl OrchestratorActor {
+    fn actor_pre_start(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async {
             info!("OrchestratorActor started in ActorSystem");
 
@@ -340,9 +340,9 @@ impl Actor for OrchestratorActor {
         })
     }
 
-    fn receive(
+    fn actor_receive(
         &mut self,
-        msg: Self::Message,
+        msg: OrchestratorMessage,
         _ctx: &mut ActorContext<Self>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         // Handle synchronous messages immediately and return an empty future.
@@ -649,8 +649,25 @@ impl Actor for OrchestratorActor {
         }
     }
 
-    fn post_stop(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    fn actor_post_stop(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async { info!("OrchestratorActor stopped"); })
+    }
+}
+
+#[async_trait::async_trait]
+impl Actor for OrchestratorActor {
+    type Message = OrchestratorMessage;
+
+    async fn pre_start(&mut self) {
+        self.actor_pre_start().await
+    }
+
+    async fn receive(&mut self, msg: Self::Message, ctx: &mut ActorContext<Self>) {
+        self.actor_receive(msg, ctx).await
+    }
+
+    async fn post_stop(&mut self) {
+        self.actor_post_stop().await
     }
 }
 
@@ -870,7 +887,7 @@ async fn call_llm_protected(
 
         // Update CB state metric
         if let Some(m) = metrics {
-            let state_val = match cb.state() {
+            let state_val = match cb.state().await {
                 pekko_actor::CircuitBreakerState::Closed   => 0.0,
                 pekko_actor::CircuitBreakerState::Open     => 1.0,
                 pekko_actor::CircuitBreakerState::HalfOpen => 2.0,

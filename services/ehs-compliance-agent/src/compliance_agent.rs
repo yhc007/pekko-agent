@@ -592,10 +592,10 @@ impl AgentActor for ComplianceAgentActor {
 
 // ─── pekko_actor::Actor implementation ──────────────────────────────────────
 
-impl Actor for ComplianceAgentActor {
-    type Message = AgentMessage;
-
-    fn receive(&mut self, msg: AgentMessage, _ctx: &mut ActorContext<Self>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+// Actor 메서드 본문 — 아래 #[async_trait] impl Actor가 위임 호출
+// (pekko_actor::Actor는 #[async_trait] trait이라 Pin<Box<..>> 수동 반환 시그니처와 불일치)
+impl ComplianceAgentActor {
+    fn actor_receive(&mut self, msg: AgentMessage, _ctx: &mut ActorContext<Self>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             match msg {
                 AgentMessage::Query(query) => {
@@ -630,6 +630,15 @@ impl Actor for ComplianceAgentActor {
         })
     }
 
+}
+
+#[async_trait::async_trait]
+impl Actor for ComplianceAgentActor {
+    type Message = AgentMessage;
+
+    async fn receive(&mut self, msg: Self::Message, ctx: &mut ActorContext<Self>) {
+        self.actor_receive(msg, ctx).await
+    }
 }
 
 // ─── pekko_persistence::PersistentActor implementation ──────────────────────
