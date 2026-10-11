@@ -58,8 +58,13 @@ impl ClaudeClient {
 
             match resp {
                 Ok(response) if response.status().is_success() => {
-                    let body: ClaudeResponse = response.json().await
+                    let text = response.text().await
                         .map_err(|e| ClientError::ParseError(e.to_string()))?;
+                    let body: ClaudeResponse = serde_json::from_str(&text).map_err(|e| {
+                        // 파싱 실패 시 원인 파악을 위해 응답 본문 앞부분을 포함
+                        let snippet: String = text.chars().take(800).collect();
+                        ClientError::ParseError(format!("{e}; body: {snippet}"))
+                    })?;
                     
                     info!(
                         model = %body.model,

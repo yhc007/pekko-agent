@@ -1025,7 +1025,7 @@ async fn run_query_loop(
             messages: messages.clone(),
             tools: claude_tools.clone(),
             max_tokens,
-            temperature: Some(cfg.temperature),
+            temperature: cfg.temperature,
             cacheable: false,
         };
 
@@ -1072,23 +1072,14 @@ async fn run_query_loop(
         total_output += resp.usage.output_tokens;
 
         if resp.stop_reason == "tool_use" {
-            let mut assistant_content = Vec::new();
-            let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
-
-            for block in &resp.content {
-                match block {
-                    ContentBlock::Text { text } => {
-                        assistant_content.push(ContentBlock::Text { text: text.clone() });
-                    }
-                    ContentBlock::ToolUse { id, name, input } => {
-                        assistant_content.push(ContentBlock::ToolUse {
-                            id: id.clone(), name: name.clone(), input: input.clone(),
-                        });
-                        tool_uses.push((id.clone(), name.clone(), input.clone()));
-                    }
-                    _ => {}
-                }
-            }
+            // 응답 content를 순서·내용 그대로 되돌림 — thinking 블록(signature)은 수정·누락 시 거부됨
+            let assistant_content = resp.content.clone();
+            let tool_uses: Vec<(String, String, serde_json::Value)> = resp.content.iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolUse { id, name, input } => Some((id.clone(), name.clone(), input.clone())),
+                    _ => None,
+                })
+                .collect();
             messages.push(ClaudeMessage { role: "assistant".to_string(), content: assistant_content });
 
             let ctx = ToolContext {
@@ -1288,7 +1279,7 @@ async fn run_stream_loop(
             messages: messages.clone(),
             tools: claude_tools.clone(),
             max_tokens,
-            temperature: Some(cfg.temperature),
+            temperature: cfg.temperature,
             cacheable: false,
         };
 
@@ -1334,23 +1325,14 @@ async fn run_stream_loop(
         total_output += resp.usage.output_tokens;
 
         if resp.stop_reason == "tool_use" {
-            let mut assistant_content = Vec::new();
-            let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
-
-            for block in &resp.content {
-                match block {
-                    ContentBlock::Text { text } => {
-                        assistant_content.push(ContentBlock::Text { text: text.clone() });
-                    }
-                    ContentBlock::ToolUse { id, name, input } => {
-                        assistant_content.push(ContentBlock::ToolUse {
-                            id: id.clone(), name: name.clone(), input: input.clone(),
-                        });
-                        tool_uses.push((id.clone(), name.clone(), input.clone()));
-                    }
-                    _ => {}
-                }
-            }
+            // 응답 content를 순서·내용 그대로 되돌림 — thinking 블록(signature)은 수정·누락 시 거부됨
+            let assistant_content = resp.content.clone();
+            let tool_uses: Vec<(String, String, serde_json::Value)> = resp.content.iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolUse { id, name, input } => Some((id.clone(), name.clone(), input.clone())),
+                    _ => None,
+                })
+                .collect();
             messages.push(ClaudeMessage { role: "assistant".to_string(), content: assistant_content });
 
             let ctx = ToolContext {
@@ -1960,7 +1942,7 @@ async fn synthesise_responses(
         }],
         system_prompt: "당신은 EHS 멀티-에이전트 종합 분석 AI입니다.".to_string(),
         max_tokens:    cfg.max_tokens,
-        temperature:   Some(cfg.temperature),
+        temperature:   cfg.temperature,
         tools:         Vec::new(),
         cacheable:     false,
     };

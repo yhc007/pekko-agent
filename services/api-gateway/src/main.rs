@@ -2030,9 +2030,12 @@ async fn main() -> anyhow::Result<()> {
         api_key: std::env::var("CLAUDE_API_KEY")
             .expect("CLAUDE_API_KEY must be set"),
         model: std::env::var("CLAUDE_MODEL")
-            .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string()),
+            .unwrap_or_else(|_| "claude-sonnet-5-5".to_string()),
         max_tokens: std::env::var("CLAUDE_MAX_TOKENS")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(4096),
+        // 선택: 미설정 시 temperature를 보내지 않음 (최신 Claude 모델은 거부)
+        temperature: std::env::var("LLM_TEMPERATURE")
+            .ok().and_then(|v| v.parse().ok()),
         ..LlmConfig::default()
     };
 

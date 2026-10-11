@@ -155,6 +155,8 @@ impl GeminiClient {
                             }
                         });
                     }
+                    // Claude 전용 사고 블록 — Gemini에는 대응 개념이 없어 전달하지 않음
+                    ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
                 }
             }
             
