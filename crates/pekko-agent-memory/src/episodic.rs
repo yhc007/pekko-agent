@@ -160,7 +160,8 @@ mod tests {
             action_taken: "execute_permit_search".to_string(),
             outcome: "found 3 permits".to_string(),
             timestamp: chrono::Utc::now(),
-            context: serde_json::json!({"query": "environmental"}),
+            session_id: uuid::Uuid::nil(),
+            reasoning: String::new(),
         };
 
         assert!(store.record_episode(episode).await.is_ok());
@@ -178,7 +179,8 @@ mod tests {
                 action_taken: format!("action-{}", i),
                 outcome: format!("outcome-{}", i),
                 timestamp: chrono::Utc::now(),
-                context: serde_json::json!({}),
+                session_id: uuid::Uuid::nil(),
+                reasoning: String::new(),
             };
             let _ = store.record_episode(episode).await;
         }
@@ -195,7 +197,8 @@ mod tests {
             action_taken: "permit_search".to_string(),
             outcome: "found permits".to_string(),
             timestamp: chrono::Utc::now(),
-            context: serde_json::json!({}),
+            session_id: uuid::Uuid::nil(),
+            reasoning: String::new(),
         };
 
         let episode2 = Episode {
@@ -203,7 +206,8 @@ mod tests {
             action_taken: "compliance_check".to_string(),
             outcome: "checked compliance".to_string(),
             timestamp: chrono::Utc::now(),
-            context: serde_json::json!({}),
+            session_id: uuid::Uuid::nil(),
+            reasoning: String::new(),
         };
 
         let _ = store.record_episode(episode1).await;
@@ -224,7 +228,8 @@ mod tests {
                 action_taken: "permit_search".to_string(),
                 outcome: format!("outcome-{}", i),
                 timestamp: chrono::Utc::now(),
-                context: serde_json::json!({}),
+                session_id: uuid::Uuid::nil(),
+                reasoning: String::new(),
             };
             let _ = store.record_episode(episode).await;
         }
@@ -249,7 +254,8 @@ mod tests {
             action_taken: "PERMIT_SEARCH".to_string(),
             outcome: "success".to_string(),
             timestamp: chrono::Utc::now(),
-            context: serde_json::json!({}),
+            session_id: uuid::Uuid::nil(),
+            reasoning: String::new(),
         };
 
         let episode2 = Episode {
@@ -257,7 +263,8 @@ mod tests {
             action_taken: "compliance_check".to_string(),
             outcome: "success".to_string(),
             timestamp: chrono::Utc::now(),
-            context: serde_json::json!({}),
+            session_id: uuid::Uuid::nil(),
+            reasoning: String::new(),
         };
 
         let _ = store.record_episode(episode1).await;
@@ -278,7 +285,8 @@ mod tests {
                 action_taken: format!("action-{}", i),
                 outcome: format!("outcome-{}", i),
                 timestamp: chrono::Utc::now(),
-                context: serde_json::json!({}),
+                session_id: uuid::Uuid::nil(),
+                reasoning: String::new(),
             };
             let _ = store.record_episode(episode).await;
         }
@@ -297,7 +305,8 @@ mod tests {
                 action_taken: format!("action-{}", i),
                 outcome: format!("outcome-{}", i),
                 timestamp: chrono::Utc::now(),
-                context: serde_json::json!({}),
+                session_id: uuid::Uuid::nil(),
+                reasoning: String::new(),
             };
             let _ = store.record_episode(episode).await;
         }
@@ -317,7 +326,8 @@ mod tests {
             action_taken: "test".to_string(),
             outcome: "test".to_string(),
             timestamp: chrono::Utc::now(),
-            context: serde_json::json!({}),
+            session_id: uuid::Uuid::nil(),
+            reasoning: String::new(),
         };
 
         let _ = store.record_episode(episode).await;
