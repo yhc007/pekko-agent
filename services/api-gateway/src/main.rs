@@ -28,7 +28,7 @@ use tracing::{info, warn, error};
 use pekko_actor::ActorRef;
 use pekko_agent_core::{TokenUsage, ShortTermMemory, AgentInfo, AgentProfile, AgentStatus};
 use pekko_agent_llm::{LlmConfig, ClaudeClient, GeminiClient, OpenAIClient};
-use pekko_agent_tools::{ToolRegistry, builtin::{PermitSearchTool, ComplianceCheckTool, EhsQueryTool}};
+use pekko_agent_tools::{ToolRegistry, builtin::{PermitSearchTool, ComplianceCheckTool, EhsQueryTool, CoreOsRobotTool}};
 use pekko_agent_memory::{PgConversationStore, PgVectorStore};
 use pekko_agent_core::{LongTermMemory, MemoryDocument};
 use pekko_agent_llm::EmbeddingClient;
@@ -2066,6 +2066,13 @@ async fn main() -> anyhow::Result<()> {
     tool_registry.register(Arc::new(PermitSearchTool::new(pg_pool.clone())));
     tool_registry.register(Arc::new(ComplianceCheckTool::new(pg_pool.clone())));
     tool_registry.register(Arc::new(EhsQueryTool::new(pg_pool.clone())));
+
+    // CoreOS 로봇 제어 보드 (선택) — 예: COREOS_ADDR=192.168.11.164:7000
+    if let Ok(coreos_addr) = std::env::var("COREOS_ADDR") {
+        info!(addr = %coreos_addr, "CoreOS robot tool enabled");
+        tool_registry.register(Arc::new(CoreOsRobotTool::new(coreos_addr)));
+    }
+
     let tool_registry = Arc::new(RwLock::new(tool_registry));
     info!(tools = tool_registry.read().await.list_tools().len(), "Tool registry ready");
 
