@@ -49,7 +49,7 @@ impl Tool for CoreOsRobotTool {
             name: "coreos_robot".to_string(),
             description: "CoreOS 로봇 제어 보드(ESP32)와 통신합니다. \
                           ping: 연결 확인 및 왕복 지연 측정, \
-                          status: 업타임/힙 메모리/E-Stop 상태 조회, \
+                          status: 업타임/힙 메모리(바이트)/E-Stop 상태 조회, \
                           emergency_stop: 긴급 정지 (보드 재부팅 전까지 해제되지 않음). \
                           모터/서보 제어는 아직 지원되지 않습니다."
                 .to_string(),
@@ -165,7 +165,25 @@ async fn request(addr: &str, msg_type: u8, payload: &[u8]) -> anyhow::Result<(u8
     Ok((header[3], body.to_vec()))
 }
 
+/// 업타임(ms)을 사람이 읽는 문자열로 — LLM이 단위 환산을 틀리지 않도록 함께 제공
+fn format_uptime(uptime_ms: u32) -> String {
+    let total = uptime_ms / 1000;
+    let (d, h, m, s) = (total / 86_400, total % 86_400 / 3_600, total % 3_600 / 60, total % 60);
+    let mut parts = Vec::new();
+    if d > 0 { parts.push(format!("{d}d")); }
+    if h > 0 || d > 0 { parts.push(format!("{h}h")); }
+    if m > 0 || h > 0 || d > 0 { parts.push(format!("{m}m")); }
+    parts.push(format!("{s}s"));
+    parts.join(" ")
+}
+
+/// 소수 첫째 자리 반올림
+fn round1(x: f64) -> f64 {
+    (x * 10.0).round() / 10.0
+}
+
 fn to_output(reply_type: u8, payload: &[u8], rtt_ms: f64) -> ToolOutput {
+    let rtt_ms = round1(rtt_ms);
     match reply_type {
         REPORT_PONG => ToolOutput::success(serde_json::json!({
             "reply": "pong",
@@ -174,11 +192,17 @@ fn to_output(reply_type: u8, payload: &[u8], rtt_ms: f64) -> ToolOutput {
         })),
         REPORT_SYSTEM_STATUS if payload.len() >= 13 => {
             let u32_at = |i: usize| u32::from_be_bytes([payload[i], payload[i + 1], payload[i + 2], payload[i + 3]]);
+            let (uptime_ms, used, free) = (u32_at(0), u32_at(4), u32_at(8));
+            let total = used + free;
+            let used_percent = if total > 0 { round1(used as f64 * 100.0 / total as f64) } else { 0.0 };
             ToolOutput::success(serde_json::json!({
                 "reply": "system_status",
-                "uptime_ms": u32_at(0),
-                "heap_used": u32_at(4),
-                "heap_free": u32_at(8),
+                "uptime_ms": uptime_ms,
+                "uptime": format_uptime(uptime_ms),
+                "heap_used_bytes": used,
+                "heap_free_bytes": free,
+                "heap_total_bytes": total,
+                "heap_used_percent": used_percent,
                 "estop": payload[12] != 0,
                 "rtt_ms": rtt_ms,
             }))
@@ -226,6 +250,14 @@ mod tests {
     }
 
     #[test]
+    fn test_format_uptime() {
+        assert_eq!(format_uptime(0), "0s");
+        assert_eq!(format_uptime(9_700), "9s");
+        assert_eq!(format_uptime(5_415_960), "1h 30m 15s");
+        assert_eq!(format_uptime(90_061_000), "1d 1h 1m 1s");
+    }
+
+    #[test]
     fn test_crc16_known_vector() {
         // CRC-16/CCITT-FALSE 표준 검증 벡터
         assert_eq!(crc16_ccitt(b"123456789"), 0x29B1);
@@ -264,8 +296,11 @@ mod tests {
 
         assert!(!out.is_error);
         assert_eq!(out.content["uptime_ms"], 9_700);
-        assert_eq!(out.content["heap_used"], 43_312);
-        assert_eq!(out.content["heap_free"], 30_416);
+        assert_eq!(out.content["uptime"], "9s");
+        assert_eq!(out.content["heap_used_bytes"], 43_312);
+        assert_eq!(out.content["heap_free_bytes"], 30_416);
+        assert_eq!(out.content["heap_total_bytes"], 73_728);
+        assert_eq!(out.content["heap_used_percent"], 58.7);
         assert_eq!(out.content["estop"], true);
         assert_eq!(board.await.unwrap(), encode_frame(CMD_REQUEST_STATUS, b""));
     }
