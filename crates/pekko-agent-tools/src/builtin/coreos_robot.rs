@@ -276,9 +276,9 @@ fn to_output(reply_type: u8, payload: &[u8], rtt_ms: f64) -> ToolOutput {
                 0x01 => "bad_frame",
                 0x02 => "unknown_command",
                 0x03 => "unsupported",
-                0x04 => "estop_active",
-                0x05 => "invalid_motor_id",
-                0x06 => "out_of_range",
+                0x04 => "estop_active — E-Stop 래치 중, 보드 재부팅 전까지 모터 명령 불가",
+                0x05 => "invalid_motor_id — motor_id는 0 또는 1",
+                0x06 => "out_of_range — target_rpm은 ±3000, accel_ms는 ≤10000",
                 _ => "unknown_error",
             };
             ToolOutput::error(format!("보드 에러: {code} (msg_type=0x{:02x})", payload[1]))
@@ -467,6 +467,16 @@ mod tests {
             .unwrap();
         assert!(out.is_error);
         assert!(out.content["error"].as_str().unwrap().contains("estop_active"));
+    }
+
+    #[tokio::test]
+    async fn test_malformed_motor_status_payload_is_error_not_panic() {
+        let (addr, _board) = mock_board(encode_frame(REPORT_MOTOR_STATUS, &[0u8; 12])).await;
+        let out = CoreOsRobotTool::new(addr)
+            .execute(serde_json::json!({"command": "motor_status"}), &ctx())
+            .await
+            .unwrap();
+        assert!(out.is_error);
     }
 
     #[tokio::test]
