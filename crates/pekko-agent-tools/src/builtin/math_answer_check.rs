@@ -1186,6 +1186,54 @@ mod tests {
         assert!(split_into_parts("").is_empty());
     }
 
+    /// The verifier demo table from section 3.7 of the source notebook
+    /// (`ch03/01_main-chapter-code/ch03_main.ipynb`), which the chapter runs
+    /// through `run_demos_table`. Each pair is one spelling of an answer
+    /// against another, with the verdict the reference reaches.
+    ///
+    /// Worth keeping in full: case 9 is a decimal truncated to ten digits,
+    /// and accepting it was a real defect in this port until the numeric
+    /// comparison was tightened. Nothing else in the suite covered it.
+    #[test]
+    fn notebook_verifier_demo_table() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("3/4", r"\frac{3}{4}", true),
+            ("(3)/(4)", "3/4", true),
+            (r"\frac{\sqrt{8}}{2}", "sqrt(2)", true),
+            (r"\( \frac{1}{2} + \frac{1}{6} \)", "2/3", true),
+            ("(1, 2)", "(1,2)", true),
+            ("(2, 1)", "(1, 2)", false),
+            ("(1, 2, 3)", "(1, 2)", false),
+            ("0.5", "1/2", true),
+            ("0.3333333333", "1/3", false),
+            ("1,234/2", "617", true),
+            (r"\text{2/3}", "2/3", true),
+            ("50%", "1/2", false),
+            (r"2\cdot 3/4", "3/2", true),
+            (r"90^\circ", "90", true),
+            (r"\left(\frac{3}{4}\right)", "3/4", true),
+            ("2²", "2**2", true),
+        ];
+
+        let mut failures = Vec::new();
+        for (i, (pred, gt, expected)) in cases.iter().enumerate() {
+            let got = grade_answer(pred, gt);
+            if got != *expected {
+                failures.push(format!(
+                    "case {}: {pred:?} vs {gt:?} -> {got}, expected {expected}",
+                    i + 1
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {} demo cases disagree with the reference:\n{}",
+            failures.len(),
+            cases.len(),
+            failures.join("\n")
+        );
+    }
+
     #[test]
     fn numeric_equivalence_without_a_cas() {
         assert!(grade_answer("1/2", "0.5"));
