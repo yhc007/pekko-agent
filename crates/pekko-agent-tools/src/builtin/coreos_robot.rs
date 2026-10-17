@@ -28,6 +28,8 @@ impl CoreOsRobotTool {
 }
 
 const TIMEOUT_MS: u64 = 5_000;
+/// set_motor_speed의 accel_ms 기본값 (계단 입력 대신 완만한 가속)
+const DEFAULT_ACCEL_MS: u16 = 500;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,11 +37,19 @@ enum Command {
     Ping,
     Status,
     EmergencyStop,
+    SetMotorSpeed,
+    MotorStatus,
 }
 
 #[derive(Deserialize)]
 struct Params {
     command: Command,
+    #[serde(default)]
+    motor_id: Option<u8>,
+    #[serde(default)]
+    target_rpm: Option<i16>,
+    #[serde(default)]
+    accel_ms: Option<u16>,
 }
 
 #[async_trait]
@@ -50,16 +60,32 @@ impl Tool for CoreOsRobotTool {
             description: "CoreOS 로봇 제어 보드(ESP32)와 통신합니다. \
                           ping: 연결 확인 및 왕복 지연 측정, \
                           status: 업타임/힙 메모리(바이트)/E-Stop 상태 조회, \
+                          set_motor_speed: 모터 속도 설정 (motor_id 0~1, target_rpm -3000~3000, \
+                          accel_ms 0~10000 기본 500 — 응답의 actual_rpm은 명령 직후 값이므로 \
+                          수렴 여부는 잠시 후 motor_status로 확인), \
+                          motor_status: 모터별 목표/실제 RPM·듀티와 제어 루프 주기 조회, \
                           emergency_stop: 긴급 정지 (보드 재부팅 전까지 해제되지 않음). \
-                          모터/서보 제어는 아직 지원되지 않습니다."
+                          현재 모터는 보드 내부 시뮬레이션입니다."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "enum": ["ping", "status", "emergency_stop"],
+                        "enum": ["ping", "status", "set_motor_speed", "motor_status", "emergency_stop"],
                         "description": "보낼 명령"
+                    },
+                    "motor_id": {
+                        "type": "integer", "minimum": 0, "maximum": 1,
+                        "description": "set_motor_speed 대상 모터"
+                    },
+                    "target_rpm": {
+                        "type": "integer", "minimum": -3000, "maximum": 3000,
+                        "description": "set_motor_speed 목표 RPM (음수는 역회전)"
+                    },
+                    "accel_ms": {
+                        "type": "integer", "minimum": 0, "maximum": 10000,
+                        "description": "set_motor_speed 가속 시간(ms), 기본 500"
                     }
                 },
                 "required": ["command"]
@@ -78,14 +104,27 @@ impl Tool for CoreOsRobotTool {
         let params: Params = serde_json::from_value(input)
             .map_err(|e| ToolError::ValidationFailed(format!("파라미터 오류: {e}")))?;
 
-        let (msg_type, payload): (u8, &[u8]) = match params.command {
-            Command::Ping => (CMD_PING, b"pekko-agent"),
-            Command::Status => (CMD_REQUEST_STATUS, b""),
-            Command::EmergencyStop => (CMD_EMERGENCY_STOP, b""),
+        let (msg_type, payload): (u8, Vec<u8>) = match params.command {
+            Command::Ping => (CMD_PING, b"pekko-agent".to_vec()),
+            Command::Status => (CMD_REQUEST_STATUS, Vec::new()),
+            Command::EmergencyStop => (CMD_EMERGENCY_STOP, Vec::new()),
+            Command::MotorStatus => (CMD_REQUEST_MOTOR_STATUS, Vec::new()),
+            Command::SetMotorSpeed => {
+                let (Some(motor_id), Some(target_rpm)) = (params.motor_id, params.target_rpm) else {
+                    return Err(ToolError::ValidationFailed(
+                        "set_motor_speed에는 motor_id와 target_rpm이 필요합니다".into(),
+                    ));
+                };
+                let accel_ms = params.accel_ms.unwrap_or(DEFAULT_ACCEL_MS);
+                let mut p = vec![motor_id];
+                p.extend_from_slice(&target_rpm.to_be_bytes());
+                p.extend_from_slice(&accel_ms.to_be_bytes());
+                (CMD_SET_MOTOR_SPEED, p)
+            }
         };
 
         let start = Instant::now();
-        let reply = tokio::time::timeout(self.timeout, request(&self.addr, msg_type, payload))
+        let reply = tokio::time::timeout(self.timeout, request(&self.addr, msg_type, &payload))
             .await
             .map_err(|_| ToolError::Timeout)?;
         let rtt_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -109,10 +148,13 @@ const STX: u8 = 0x02;
 const ETX: u8 = 0x03;
 const MAX_PAYLOAD: usize = 256;
 
+const CMD_SET_MOTOR_SPEED: u8 = 0x10;
 const CMD_EMERGENCY_STOP: u8 = 0x1F;
 const CMD_REQUEST_STATUS: u8 = 0x20;
+const CMD_REQUEST_MOTOR_STATUS: u8 = 0x21;
 const CMD_PING: u8 = 0xFE;
 
+const REPORT_MOTOR_STATUS: u8 = 0x81;
 const REPORT_SYSTEM_STATUS: u8 = 0x82;
 const REPORT_ERROR_ALERT: u8 = 0x8F;
 const REPORT_PONG: u8 = 0xFF;
@@ -207,11 +249,36 @@ fn to_output(reply_type: u8, payload: &[u8], rtt_ms: f64) -> ToolOutput {
                 "rtt_ms": rtt_ms,
             }))
         }
+        REPORT_MOTOR_STATUS if payload.len() >= 10 && (payload.len() - 10) % 7 == 0 => {
+            let u32_at = |i: usize| u32::from_be_bytes([payload[i], payload[i + 1], payload[i + 2], payload[i + 3]]);
+            let motors: Vec<serde_json::Value> = payload[10..]
+                .chunks_exact(7)
+                .map(|m| {
+                    serde_json::json!({
+                        "motor_id": m[0],
+                        "target_rpm": i16::from_be_bytes([m[1], m[2]]),
+                        "actual_rpm": i16::from_be_bytes([m[3], m[4]]),
+                        "duty_percent": i16::from_be_bytes([m[5], m[6]]) as f64 / 10.0,
+                    })
+                })
+                .collect();
+            ToolOutput::success(serde_json::json!({
+                "reply": "motor_status",
+                "loop_hz": u16::from_be_bytes([payload[0], payload[1]]),
+                "loop_max_interval_us": u32_at(2),
+                "loop_overruns": u32_at(6),
+                "motors": motors,
+                "rtt_ms": rtt_ms,
+            }))
+        }
         REPORT_ERROR_ALERT if payload.len() >= 2 => {
             let code = match payload[0] {
                 0x01 => "bad_frame",
                 0x02 => "unknown_command",
                 0x03 => "unsupported",
+                0x04 => "estop_active",
+                0x05 => "invalid_motor_id",
+                0x06 => "out_of_range",
                 _ => "unknown_error",
             };
             ToolOutput::error(format!("보드 에러: {code} (msg_type=0x{:02x})", payload[1]))
@@ -330,6 +397,78 @@ mod tests {
         assert!(out.content["error"].as_str().unwrap().contains("CRC"));
     }
 
+    fn motor_status_payload() -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&998u16.to_be_bytes());
+        p.extend_from_slice(&2_345u32.to_be_bytes());
+        p.extend_from_slice(&3u32.to_be_bytes());
+        for (id, target, actual, duty) in [(0u8, 1200i16, 1195i16, 412i16), (1, 0, 0, 0)] {
+            p.push(id);
+            p.extend_from_slice(&target.to_be_bytes());
+            p.extend_from_slice(&actual.to_be_bytes());
+            p.extend_from_slice(&duty.to_be_bytes());
+        }
+        p
+    }
+
+    #[tokio::test]
+    async fn test_set_motor_speed_encodes_command_and_parses_status() {
+        let (addr, board) = mock_board(encode_frame(REPORT_MOTOR_STATUS, &motor_status_payload())).await;
+        let out = CoreOsRobotTool::new(addr)
+            .execute(
+                serde_json::json!({"command": "set_motor_speed", "motor_id": 0, "target_rpm": 1200, "accel_ms": 300}),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.content["reply"], "motor_status");
+        assert_eq!(out.content["loop_hz"], 998);
+        assert_eq!(out.content["motors"][0]["target_rpm"], 1200);
+        assert_eq!(out.content["motors"][0]["actual_rpm"], 1195);
+        assert_eq!(out.content["motors"][0]["duty_percent"], 41.2);
+
+        let mut expected = vec![0u8];
+        expected.extend_from_slice(&1200i16.to_be_bytes());
+        expected.extend_from_slice(&300u16.to_be_bytes());
+        assert_eq!(board.await.unwrap(), encode_frame(CMD_SET_MOTOR_SPEED, &expected));
+    }
+
+    #[tokio::test]
+    async fn test_set_motor_speed_requires_params_and_defaults_accel() {
+        let missing = CoreOsRobotTool::new("127.0.0.1:1")
+            .execute(serde_json::json!({"command": "set_motor_speed", "motor_id": 0}), &ctx())
+            .await;
+        assert!(matches!(missing, Err(ToolError::ValidationFailed(_))));
+
+        let (addr, board) = mock_board(encode_frame(REPORT_MOTOR_STATUS, &motor_status_payload())).await;
+        CoreOsRobotTool::new(addr)
+            .execute(serde_json::json!({"command": "set_motor_speed", "motor_id": 1, "target_rpm": -500}), &ctx())
+            .await
+            .unwrap();
+        // 페이로드: motor 1, -500 = 0xFE0C, 기본 가속 500ms = 0x01F4
+        assert_eq!(&board.await.unwrap()[4..9], &[1, 0xFE, 0x0C, 0x01, 0xF4]);
+    }
+
+    #[tokio::test]
+    async fn test_motor_status_request_and_estop_error() {
+        let (addr, board) = mock_board(encode_frame(REPORT_MOTOR_STATUS, &motor_status_payload())).await;
+        let out = CoreOsRobotTool::new(addr)
+            .execute(serde_json::json!({"command": "motor_status"}), &ctx())
+            .await
+            .unwrap();
+        assert_eq!(out.content["motors"].as_array().unwrap().len(), 2);
+        assert_eq!(board.await.unwrap(), encode_frame(CMD_REQUEST_MOTOR_STATUS, b""));
+
+        let (addr, _board) = mock_board(encode_frame(REPORT_ERROR_ALERT, &[0x04, CMD_SET_MOTOR_SPEED])).await;
+        let out = CoreOsRobotTool::new(addr)
+            .execute(serde_json::json!({"command": "set_motor_speed", "motor_id": 0, "target_rpm": 100}), &ctx())
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content["error"].as_str().unwrap().contains("estop_active"));
+    }
+
     #[tokio::test]
     async fn test_invalid_command_is_validation_error() {
         let result = CoreOsRobotTool::new("127.0.0.1:1")
@@ -352,5 +491,28 @@ mod tests {
             println!("{command}: {}", out.content);
             assert!(!out.is_error, "{command} failed: {}", out.content);
         }
+    }
+
+    /// 실보드 모터 계단 응답: COREOS_ADDR=... cargo test -p pekko-agent-tools live_board_motor -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn live_board_motor_step() {
+        let tool = CoreOsRobotTool::new(std::env::var("COREOS_ADDR").expect("COREOS_ADDR not set"));
+        let out = tool
+            .execute(
+                serde_json::json!({"command": "set_motor_speed", "motor_id": 0, "target_rpm": 1200, "accel_ms": 300}),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let out = tool.execute(serde_json::json!({"command": "motor_status"}), &ctx()).await.unwrap();
+        println!("motor_status: {}", out.content);
+        let actual = out.content["motors"][0]["actual_rpm"].as_f64().unwrap();
+        assert!((actual - 1200.0).abs() <= 24.0, "actual {actual}");
+        tool.execute(serde_json::json!({"command": "set_motor_speed", "motor_id": 0, "target_rpm": 0}), &ctx())
+            .await
+            .unwrap();
     }
 }
